@@ -39,6 +39,7 @@ class Args:
     wandb_group: str = '.'
     capture_video: bool = False
     checkpoint: bool = False
+    checkpoint_final_rb: bool = False
 
     # environment specific arguments
     env_id: str = "ant"
@@ -251,12 +252,14 @@ if __name__ == "__main__":
     args.env_steps_per_actor_step = args.num_envs * args.unroll_length
     args.num_prefill_env_steps = args.min_replay_size * args.num_envs
     args.num_prefill_actor_steps = np.ceil(args.min_replay_size / args.unroll_length)
-    args.num_training_steps_per_epoch = (args.total_env_steps - args.num_prefill_env_steps) // (
-                args.num_epochs * args.env_steps_per_actor_step)
+    args.num_training_steps_per_epoch = np.ceil(
+        (args.total_env_steps - args.num_prefill_env_steps) / (args.num_epochs * args.env_steps_per_actor_step)
+    )
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
-    os.path.makedirs(args.wandb_dir, exist_ok=True)
+    save_path = os.path.join(args.wandb_dir, run_name)
+    os.makedirs(save_path, exist_ok=True)
     if args.track:
 
         if args.wandb_group == '.':
@@ -277,12 +280,6 @@ if __name__ == "__main__":
         if args.wandb_mode == 'offline':
             wandb_osh.set_log_level("ERROR")
             trigger_sync = TriggerWandbSyncHook()
-
-    if args.checkpoint:
-        from pathlib import Path
-
-        save_path = Path(args.wandb_dir) / Path(run_name)
-        os.mkdir(path=save_path)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -697,7 +694,10 @@ if __name__ == "__main__":
         if args.checkpoint:
             # Save current policy and critic params.
             params = (
-            training_state.alpha_state.params, training_state.actor_state.params, training_state.critic_state.params)
+                training_state.alpha_state.params,
+                training_state.actor_state.params,
+                training_state.critic_state.params,
+            )
             path = f"{save_path}/step_{int(training_state.env_steps)}.pkl"
             save_params(path, params)
 
@@ -710,9 +710,16 @@ if __name__ == "__main__":
     if args.checkpoint:
         # Save current policy and critic params.
         params = (
-        training_state.alpha_state.params, training_state.actor_state.params, training_state.critic_state.params)
+            training_state.alpha_state.params,
+            training_state.actor_state.params,
+            training_state.critic_state.params
+        )
         path = f"{save_path}/final.pkl"
         save_params(path, params)
+
+        if args.checkpoint_final_rb:
+            path = f"{save_path}/final_rb.pkl"
+            save_params(path, buffer_state)
 
     render(training_state.actor_state, env, args.wandb_dir, args.exp_name)
 

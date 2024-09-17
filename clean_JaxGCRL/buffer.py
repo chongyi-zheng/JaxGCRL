@@ -177,9 +177,9 @@ class TrajectoryUniformSamplingQueue():
         # Because it's vmaped transition.obs.shape is of shape (episode_len, obs_dim)
         seq_len = transition.observation.shape[0]
         arrangement = jnp.arange(seq_len)
-        is_future_mask = jnp.array(arrangement[:, None] < arrangement[None], dtype=jnp.float32) # upper triangular matrix of shape seq_len, seq_len where all non-zero entries are 1
+        is_future_mask = jnp.array(arrangement[:, None] < arrangement[None], dtype=jnp.float32) # upper triangular matrix of shape seq_len, where all non-zero entries are 1
         discount = gamma ** jnp.array(arrangement[None] - arrangement[:, None], dtype=jnp.float32)        
-        probs = is_future_mask * discount  
+        probs = is_future_mask * discount
 
         # probs is an upper triangular matrix of shape seq_len, seq_len of the form:
         #    [[0.        , 0.99      , 0.98010004, 0.970299  , 0.960596 ],

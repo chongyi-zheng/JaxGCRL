@@ -275,7 +275,6 @@ class AntMaze(PipelineEnv):
             distance_from_origin=math.safe_norm(pipeline_state.x.pos[0]),
             x_velocity=velocity[0],
             y_velocity=velocity[1],
-            forward_reward=forward_reward,
             dist=dist,
             success=success,
             success_easy=success_easy

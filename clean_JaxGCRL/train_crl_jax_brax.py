@@ -32,12 +32,13 @@ class Args:
     torch_deterministic: bool = True
     cuda: bool = True
     track: bool = False
+    log_dir: str = '.'
     wandb_project_name: str = "exploration"
     wandb_entity: str = 'chongyiz1'
     wandb_mode: str = 'offline'
-    wandb_dir: str = '.'
     wandb_group: str = '.'
     capture_video: bool = False
+    num_epochs_per_checkpoint: int = 10
     checkpoint: bool = False
     checkpoint_final_rb: bool = False
 
@@ -59,6 +60,7 @@ class Args:
     alpha_lr: float = 3e-4
     batch_size: int = 256
     gamma: float = 0.99
+    repr_dim: int = 64
     logsumexp_penalty_coeff: float = 0.1
 
     max_replay_size: int = 10000
@@ -78,7 +80,8 @@ class Args:
 
 
 class SA_encoder(nn.Module):
-    norm_type = "layer_norm"
+    repr_dim: int = 64
+    norm_type: str = "layer_norm"
 
     @nn.compact
     def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
@@ -104,12 +107,13 @@ class SA_encoder(nn.Module):
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(64, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         return x
 
 
 class G_encoder(nn.Module):
-    norm_type = "layer_norm"
+    repr_dim: int = 64
+    norm_type: str = "layer_norm"
 
     @nn.compact
     def __call__(self, g: jnp.ndarray):
@@ -134,16 +138,16 @@ class G_encoder(nn.Module):
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(64, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         return x
 
 
 class Actor(nn.Module):
     action_size: int
-    norm_type = "layer_norm"
+    norm_type: str = "layer_norm"
 
-    LOG_STD_MAX = 2
-    LOG_STD_MIN = -5
+    log_std_max: int = 2
+    log_std_min: int = -5
 
     @nn.compact
     def __call__(self, x):
@@ -172,7 +176,7 @@ class Actor(nn.Module):
         log_std = nn.Dense(self.action_size, kernel_init=lecun_uniform, bias_init=bias_init)(x)
 
         log_std = nn.tanh(log_std)
-        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (
+        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (
                     log_std + 1)  # From SpinUp / Denis Yarats
 
         return mean, log_std
@@ -258,8 +262,12 @@ if __name__ == "__main__":
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
-    save_path = os.path.join(args.wandb_dir, run_name)
+    save_path = os.path.join(args.log_dir, run_name)
     os.makedirs(save_path, exist_ok=True)
+
+    with open(os.path.join(save_path, 'args.pkl'), 'wb') as f:
+        pickle.dump(args, f)
+
     if args.track:
 
         if args.wandb_group == '.':
@@ -270,7 +278,7 @@ if __name__ == "__main__":
             entity=args.wandb_entity,
             mode=args.wandb_mode,
             group=args.wandb_group,
-            dir=args.wandb_dir,
+            dir=save_path,
             config=vars(args),
             name=run_name,
             monitor_gym=True,
@@ -338,11 +346,11 @@ if __name__ == "__main__":
     )
 
     # Critic
-    sa_encoder = SA_encoder()
+    sa_encoder = SA_encoder(repr_dim=args.repr_dim)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    g_encoder = G_encoder()
+    g_encoder = G_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
-    c = jnp.asarray(0.0, dtype=jnp.float32)
+    # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
         params={"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params},
@@ -691,7 +699,7 @@ if __name__ == "__main__":
 
         print(metrics)
 
-        if args.checkpoint:
+        if args.checkpoint and ne % args.num_epochs_per_checkpoint == 0:
             # Save current policy and critic params.
             params = (
                 training_state.alpha_state.params,
@@ -721,7 +729,7 @@ if __name__ == "__main__":
             path = f"{save_path}/final_rb.pkl"
             save_params(path, buffer_state)
 
-    render(training_state.actor_state, env, args.wandb_dir, args.exp_name)
+    render(training_state.actor_state, env, save_path, args.exp_name)
 
 # (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)
 # 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step 

@@ -216,13 +216,21 @@ class Actor(nn.Module):
 
 class RotationMatrix(nn.Module):
     repr_dim: int = 64
+    ortho_rot: bool = False
 
     def setup(self):
         self.rotation = self.param('rotation', lambda key, shape: jnp.eye(shape[0], dtype=jnp.float32),
                                     (self.repr_dim, self.repr_dim))
     @nn.compact
     def __call__(self, s_repr):
-        s_repr = jnp.einsum('jk,ik->ij', self.rotation, s_repr)
+        if self.ortho_rot:
+            I = jnp.eye(self.repr_dim)
+            rotation = self.rotation - self.rotation.T
+            rotation = (I + rotation) @ jnp.linalg.inv(I - rotation)
+        else:
+            rotation = self.rotation
+
+        s_repr = jnp.einsum('jk,ik->ij', rotation, s_repr)
 
         return s_repr
 
@@ -338,7 +346,8 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, buffer_key, env_key, eval_env_key, actor_key, sa_key, g_key, rot_key = jax.random.split(key, 8)
+    key, buffer_key, env_key, eval_env_key, actor_key, sa_key, next_s_key, s_key, rot_key = jax.random.split(
+        key, 9)
 
     # Environment setup    
     if args.env_id == "ant":
@@ -394,13 +403,17 @@ if __name__ == "__main__":
     # Critic
     sa_encoder = SAEncoder(repr_dim=args.repr_dim)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
+    next_s_encoder = SEncoder(repr_dim=args.repr_dim)
+    next_s_encoder_params = next_s_encoder.init(next_s_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
     s_encoder = SEncoder(repr_dim=args.repr_dim)
-    s_encoder_params = s_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
+    s_encoder_params = s_encoder.init(s_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
     rotation = RotationMatrix(repr_dim=args.repr_dim)
     rot_params = rotation.init(rot_key, np.ones([1, args.repr_dim]))
     critic_state = TrainState.create(
         apply_fn=None,
-        params={"sa_encoder": sa_encoder_params, "s_encoder": s_encoder_params,
+        params={"sa_encoder": sa_encoder_params,
+                "s_encoder": s_encoder_params,
+                "next_s_encoder": next_s_encoder_params,
                 "rotation": rot_params},
         tx=optax.adam(learning_rate=args.critic_lr),
     )
@@ -535,7 +548,7 @@ if __name__ == "__main__":
             # expected_shape of transitions.observations = batch_size, obs_size + goal_size
             obs = transitions.observation[:, :args.obs_dim]
             # next_obs = transitions.extras['next_state']
-            random_next_obs = jnp.roll(obs, shift=1, axis=0)[:, args.goal_start_idx:args.goal_end_idx]
+            random_obs = jnp.roll(obs, shift=1, axis=0)[:, args.goal_start_idx:args.goal_end_idx]
             future_state = transitions.extras["future_state"]
             goal = future_state[:, args.goal_start_idx:args.goal_end_idx]
             observation = jnp.concatenate([obs, goal], axis=1)
@@ -548,24 +561,39 @@ if __name__ == "__main__":
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sa_encoder_params, s_encoder_params, rot_params = (
-                critic_params["sa_encoder"], critic_params["s_encoder"], critic_params["rotation"])
+            sa_encoder_params, s_encoder_params, next_s_encoder_params, rot_params = (
+                critic_params["sa_encoder"], critic_params["s_encoder"],
+                critic_params["next_s_encoder"], critic_params["rotation"])
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
-            random_next_s_repr = s_encoder.apply(s_encoder_params, random_next_obs)
+            random_s_next_repr = next_s_encoder.apply(next_s_encoder_params, random_obs)
+            random_s_repr = s_encoder.apply(s_encoder_params, random_obs)
+            g_next_repr = next_s_encoder.apply(next_s_encoder_params, goal)
             g_repr = s_encoder.apply(s_encoder_params, goal)
-            rotated_random_next_s_repr = rotation.apply(rot_params, random_next_s_repr)
-            rotated_g_repr = rotation.apply(rot_params, g_repr)
+            rotated_random_s_repr = rotation.apply(rot_params, random_s_repr)
+            # rotated_g_repr = rotation.apply(rot_params, g_repr)
 
             # target_repr = (1 - args.gamma) * g_repr + args.gamma * random_next_s_repr
-            # qf_pi = -jnp.sqrt(jnp.sum((sa_repr - target_repr) ** 2, axis=-1))
-            qf_pi1 = -jnp.sqrt(jnp.sum((sa_repr - rotated_g_repr) ** 2, axis=-1))
+            # qf_pi1 = -jnp.sqrt(jnp.sum((sa_repr - rotated_g_repr) ** 2, axis=-1))
+            # qf_pi2 = jax.nn.logsumexp(
+            #     -jnp.sqrt(jnp.sum((sa_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1))
+            #     - jnp.sqrt(jnp.sum((g_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1)),
+            #     axis=-1
+            # )
+            qf_pi1 = -jnp.sqrt(jnp.sum((sa_repr - g_next_repr) ** 2, axis=-1))
             qf_pi2 = jax.nn.logsumexp(
-                -jnp.sqrt(jnp.sum((sa_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1))
-                -jnp.sqrt(jnp.sum((g_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1)),
+                -jnp.sqrt(jnp.sum((sa_repr[:, None] - random_s_next_repr[None, :]) ** 2, axis=-1))
+                -jnp.sqrt(jnp.sum((g_repr[:, None] - rotated_random_s_repr[None, :]) ** 2, axis=-1)),
                 axis=-1
             )
+            # logits1 = -jnp.sqrt(jnp.sum((sa_repr - rotated_g_repr) ** 2, axis=-1))
+            # logits2 = -jnp.sqrt(jnp.sum((sa_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1)) \
+            #           - jnp.sqrt(jnp.sum((g_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1))
             qf_pi = (1 - args.gamma) * qf_pi1 + args.gamma * qf_pi2
-
+            # qf_pi = (1 - args.gamma) * jnp.exp(logits1) + args.gamma * jnp.mean(jnp.exp(logits2), axis=-1)
+            # logits1 = -jnp.sqrt(jnp.sum((sa_repr - rotated_g_repr) ** 2, axis=-1))
+            # logits2 = -jnp.sqrt(jnp.sum((sa_repr - rotated_random_next_s_repr) ** 2, axis=-1)) \
+            #           - jnp.sqrt(jnp.sum((g_repr - rotated_random_next_s_repr) ** 2, axis=-1))
+            # qf_pi = (1 - args.gamma) * logits1 + args.gamma * logits2
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
 
             return actor_loss, log_prob
@@ -598,9 +626,9 @@ if __name__ == "__main__":
     @jax.jit
     def update_critic(transitions, training_state):
         def critic_loss(critic_params, transitions):
-            sa_encoder_params, s_encoder_params, rot_params = (
+            sa_encoder_params, s_encoder_params, next_s_encoder_params, rot_params = (
                 critic_params["sa_encoder"], critic_params["s_encoder"],
-                critic_params["rotation"])
+                critic_params["next_s_encoder"], critic_params["rotation"])
 
             obs = transitions.observation[:, :args.obs_dim]
             next_obs = transitions.extras['next_state'][:, args.goal_start_idx:args.goal_end_idx]
@@ -610,13 +638,15 @@ if __name__ == "__main__":
 
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
             s_repr = s_encoder.apply(s_encoder_params, obs[:, args.goal_start_idx:args.goal_end_idx])
-            next_s_repr = s_encoder.apply(s_encoder_params, next_obs)
+            next_s_repr = next_s_encoder.apply(next_s_encoder_params, next_obs)
             g_repr = s_encoder.apply(s_encoder_params, goal)
             rotated_s_repr = rotation.apply(rot_params, s_repr)
-            rotated_next_s_repr = rotation.apply(rot_params, next_s_repr)
+            # rotated_next_s_repr = rotation.apply(rot_params, next_s_repr)
+            # rotated_g_repr = rotation.apply(rot_params, g_repr)
 
             # one-step InfoNCE
-            one_step_logits = -jnp.sqrt(jnp.sum((sa_repr[:, None] - rotated_next_s_repr[None, :]) ** 2, axis=-1))  # shape = BxB
+            one_step_logits = -jnp.sqrt(jnp.sum((sa_repr[:, None] - next_s_repr[None, :]) ** 2, axis=-1))  # shape = BxB
+            # one_step_logits = -jnp.sqrt(jnp.sum((sa_repr[:, None] - next_s_repr[None, :]) ** 2, axis=-1))  # shape = BxB
             one_step_forward_critic_loss = -jnp.mean(
                 jnp.diag(one_step_logits) - jax.nn.logsumexp(one_step_logits, axis=1))
             one_step_backward_critic_loss = -jnp.mean(
@@ -628,6 +658,7 @@ if __name__ == "__main__":
             # g_repr = jnp.einsum('jk,ik->ij', rot_params, g_repr)
             # g_repr = rotation.apply(rot_params, g_repr)
             multi_step_logits = -jnp.sqrt(jnp.sum((rotated_s_repr[:, None] - g_repr[None, :]) ** 2, axis=-1))
+            # multi_step_logits = -jnp.sqrt(jnp.sum((s_repr[:, None] - rotated_g_repr[None, :]) ** 2, axis=-1))
             multi_step_forward_critic_loss = -jnp.mean(
                 jnp.diag(multi_step_logits) - jax.nn.logsumexp(multi_step_logits, axis=1))
             multi_step_backward_critic_loss = -jnp.mean(

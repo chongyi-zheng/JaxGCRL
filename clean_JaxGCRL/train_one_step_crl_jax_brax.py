@@ -540,8 +540,8 @@ if __name__ == "__main__":
 
 
     @jax.jit
-    def update_critic(transitions, training_state, key):
-        def critic_loss(critic_params, transitions, key):
+    def update_critic(transitions, training_state):
+        def critic_loss(critic_params, transitions):
             sa_encoder_params, s_encoder_params, rot_params = (
                 critic_params["sa_encoder"], critic_params["s_encoder"], critic_params["rotation"])
 
@@ -592,7 +592,7 @@ if __name__ == "__main__":
 
         (loss, (one_step_correct, one_step_logits_pos, one_step_logits_neg,
                 multi_step_correct, multi_step_logits_pos, multi_step_logits_neg)), grad = jax.value_and_grad(
-            critic_loss, has_aux=True)(training_state.critic_state.params, transitions, key)
+            critic_loss, has_aux=True)(training_state.critic_state.params, transitions)
         new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
         training_state = training_state.replace(critic_state=new_critic_state)
 
@@ -603,7 +603,7 @@ if __name__ == "__main__":
             "multi_step_categorical_accuracy": jnp.mean(multi_step_correct),
             "multi_step_logits_pos": multi_step_logits_pos,
             "multi_step_logits_neg": multi_step_logits_neg,
-            "critic_loss": critic_loss,
+            "critic_loss": loss,
         }
 
         return training_state, metrics
@@ -612,11 +612,11 @@ if __name__ == "__main__":
     @jax.jit
     def sgd_step(carry, transitions):
         training_state, key = carry
-        key, critic_key, actor_key, = jax.random.split(key, 3)
+        key, actor_key, = jax.random.split(key, 2)
 
         training_state, actor_metrics = update_actor_and_alpha(transitions, training_state, actor_key)
 
-        training_state, critic_metrics = update_critic(transitions, training_state, critic_key)
+        training_state, critic_metrics = update_critic(transitions, training_state)
 
         training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
 

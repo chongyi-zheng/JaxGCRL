@@ -61,7 +61,7 @@ class Args:
     batch_size: int = 256
     gamma: float = 0.99
     repr_dim: int = 64
-    # logsumexp_penalty_coeff: float = 0.1
+    logsumexp_penalty_coeff: float = 0.1
 
     max_replay_size: int = 10000
     min_replay_size: int = 1000
@@ -79,7 +79,7 @@ class Args:
     """the number of training steps per epoch(computed in runtime)"""
 
 
-class SAEncoder(nn.Module):
+class SA_encoder(nn.Module):
     repr_dim: int = 64
     norm_type: str = "layer_norm"
 
@@ -111,7 +111,7 @@ class SAEncoder(nn.Module):
         return x
 
 
-class SEncoder(nn.Module):
+class G_encoder(nn.Module):
     repr_dim: int = 64
     norm_type: str = "layer_norm"
 
@@ -177,62 +177,10 @@ class Actor(nn.Module):
 
         log_std = nn.tanh(log_std)
         log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (
-                log_std + 1)  # From SpinUp / Denis Yarats
+                    log_std + 1)  # From SpinUp / Denis Yarats
 
         return mean, log_std
 
-
-# class Critic(nn.Module):
-#     repr_dim: int = 64
-#     norm_type: str = 'layer_norm'
-#     ortho_rot: bool = False
-#
-#     def setup(self):
-#         self.sa_encoder = SAEncoder(repr_dim=self.repr_dim, norm_type=self.norm_type)
-#         self.s_encoder = SEncoder(repr_dim=self.repr_dim, norm_type=self.norm_type)
-#         self.rotation = self.param('rotation', lambda key, shape: jnp.eye(shape[0], dtype=jnp.float32),
-#                                    (self.repr_dim, self.repr_dim))
-#
-#     def sa_encoder(self, observations, actions):
-#         sa_repr = self.sa_encoder(observations, actions)
-#         return sa_repr
-#
-#     def s_encoder(self, observations):
-#         s_repr = self.s_encoder(observations)
-#         return s_repr
-#
-#     def rotated_s_encoder(self, observations):
-#         s_repr = self.s_encoder(observations)
-#         s_repr = jnp.einsum('jk,ik->ij', self.rotation, s_repr)
-#         return s_repr
-#     @nn.compact
-#     def __call__(self, observations, actions, next_observations, goals):
-#         sa_repr = self.sa_encoder(observations, actions)
-#         next_s_repr = self.s_encoder(next_observations)
-#         g_repr = self.s_encoder(goals)
-#         g_repr = jnp.einsum('jk,ik->ij', self.rotation, g_repr)
-#
-#         return sa_repr, next_s_repr, g_repr
-
-class RotationMatrix(nn.Module):
-    repr_dim: int = 64
-    ortho_rot: bool = False
-
-    def setup(self):
-        self.rotation = self.param('rotation', lambda key, shape: jnp.eye(shape[0], dtype=jnp.float32),
-                                    (self.repr_dim, self.repr_dim))
-    @nn.compact
-    def __call__(self, s_repr):
-        if self.ortho_rot:
-            I = jnp.eye(self.repr_dim)
-            rotation = self.rotation - self.rotation.T
-            rotation = (I + rotation) @ jnp.linalg.inv(I - rotation)
-        else:
-            rotation = self.rotation
-
-        s_repr = jnp.einsum('jk,ik->ij', rotation, s_repr)
-
-        return s_repr
 
 @flax.struct.dataclass
 class TrainingState:
@@ -265,8 +213,7 @@ def save_params(path: str, params: Any):
         fout.write(pickle.dumps(params))
 
 
-def render(actor_state, env, exp_dir, exp_name, deterministic=True,
-           wandb_track=False):
+def render(actor_state, env, exp_dir, exp_name, deterministic=True):
     def actor_sample(observations, key, deterministic=deterministic):
         means, log_stds = actor.apply(actor_state.params, observations)
         if deterministic:
@@ -299,8 +246,7 @@ def render(actor_state, env, exp_dir, exp_name, deterministic=True,
     url = html.render(env.sys.replace(dt=env.dt), rollout, height=480)
     with open(os.path.join(exp_dir, f"{exp_name}.html"), "w") as file:
         file.write(url)
-    if wandb_track:
-        wandb.log({"render": wandb.Html(url)})
+    wandb.log({"render": wandb.Html(url)})
 
 
 if __name__ == "__main__":
@@ -346,8 +292,7 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, buffer_key, env_key, eval_env_key, actor_key, sa_key, next_s_key, s_key, g_key, rot_key = jax.random.split(
-        key, 10)
+    key, buffer_key, env_key, eval_env_key, actor_key, sa_key, g_key = jax.random.split(key, 7)
 
     # Environment setup    
     if args.env_id == "ant":
@@ -401,23 +346,14 @@ if __name__ == "__main__":
     )
 
     # Critic
-    sa_encoder = SAEncoder(repr_dim=args.repr_dim)
+    sa_encoder = SA_encoder(repr_dim=args.repr_dim)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    next_s_encoder = SEncoder(repr_dim=args.repr_dim)
-    next_s_encoder_params = next_s_encoder.init(next_s_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
-    s_encoder = SEncoder(repr_dim=args.repr_dim)
-    s_encoder_params = s_encoder.init(s_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
-    g_encoder = SEncoder(repr_dim=args.repr_dim)
-    g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
-    rotation = RotationMatrix(repr_dim=args.repr_dim)
-    rot_params = rotation.init(rot_key, np.ones([1, args.repr_dim]))
+    g_encoder = SA_encoder(repr_dim=args.repr_dim)
+    g_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
+    # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
-        params={"sa_encoder": sa_encoder_params,
-                "s_encoder": s_encoder_params,
-                "next_s_encoder": next_s_encoder_params,
-                "g_encoder": g_encoder_params,
-                "rotation": rot_params},
+        params={"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params},
         tx=optax.adam(learning_rate=args.critic_lr),
     )
 
@@ -548,13 +484,12 @@ if __name__ == "__main__":
     @jax.jit
     def update_actor_and_alpha(transitions, training_state, key):
         def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
-            # expected_shape of transitions.observations = batch_size, obs_size + goal_size
-            obs = transitions.observation[:, :args.obs_dim]
-            # next_obs = transitions.extras['next_state']
-            random_obs = jnp.roll(obs, shift=1, axis=0)[:, args.goal_start_idx:args.goal_end_idx]
-            future_state = transitions.extras["future_state"]
-            goal = future_state[:, args.goal_start_idx:args.goal_end_idx]
-            observation = jnp.concatenate([obs, goal], axis=1)
+            obs = transitions.observation  # expected_shape = batch_size, obs_size + goal_size
+            state = obs[:, :args.obs_dim]
+            goal = transitions.extras["future_state"]
+            goal_action = transitions.extras["future_action"]
+            # goal = future_state[:, args.goal_start_idx: args.goal_end_idx]
+            observation = jnp.concatenate([state, goal], axis=1)
 
             means, log_stds = actor.apply(actor_params, observation)
             stds = jnp.exp(log_stds)
@@ -564,42 +499,13 @@ if __name__ == "__main__":
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sa_encoder_params, s_encoder_params, next_s_encoder_params, g_encoder_params, rot_params = (
-                critic_params["sa_encoder"], critic_params["s_encoder"],
-                critic_params["next_s_encoder"], critic_params["g_encoder"],
-                critic_params["rotation"])
-            sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
-            random_s_next_repr = next_s_encoder.apply(next_s_encoder_params, random_obs)
-            random_s_repr = s_encoder.apply(s_encoder_params, random_obs)
-            g_next_repr = next_s_encoder.apply(next_s_encoder_params, goal)
-            g_repr = g_encoder.apply(g_encoder_params, goal)
-            # rotated_random_s_repr = rotation.apply(rot_params, random_s_repr)
-            # rotated_g_repr = rotation.apply(rot_params, g_repr)
+            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
+            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+            g_repr = g_encoder.apply(g_encoder_params, goal, goal_action)
 
-            # target_repr = (1 - args.gamma) * g_repr + args.gamma * random_next_s_repr
-            # qf_pi1 = -jnp.sqrt(jnp.sum((sa_repr - rotated_g_repr) ** 2, axis=-1))
-            # qf_pi2 = jax.nn.logsumexp(
-            #     -jnp.sqrt(jnp.sum((sa_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1))
-            #     - jnp.sqrt(jnp.sum((g_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1)),
-            #     axis=-1
-            # )
-            qf_pi1 = -jnp.sqrt(jnp.sum((sa_repr - g_next_repr) ** 2, axis=-1))
-            qf_pi2 = jax.nn.logsumexp(
-                -jnp.sqrt(jnp.sum((sa_repr[:, None] - random_s_next_repr[None, :]) ** 2, axis=-1))
-                -jnp.sqrt(jnp.sum((g_repr[:, None] - random_s_repr[None, :]) ** 2, axis=-1)),
-                axis=-1
-            )
-            # logits1 = -jnp.sqrt(jnp.sum((sa_repr - rotated_g_repr) ** 2, axis=-1))
-            # logits2 = -jnp.sqrt(jnp.sum((sa_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1)) \
-            #           - jnp.sqrt(jnp.sum((g_repr[:, None] - rotated_random_next_s_repr[None, :]) ** 2, axis=-1))
-            # qf_pi = (1 - args.gamma) * qf_pi1 + args.gamma * qf_pi2
-            qf_pi = (1 - args.gamma) * qf_pi1 + args.gamma * qf_pi2
-            # qf_pi = (1 - args.gamma) * jnp.exp(logits1) + args.gamma * jnp.mean(jnp.exp(logits2), axis=-1)
-            # logits1 = -jnp.sqrt(jnp.sum((sa_repr - rotated_g_repr) ** 2, axis=-1))
-            # logits2 = -jnp.sqrt(jnp.sum((sa_repr - rotated_random_next_s_repr) ** 2, axis=-1)) \
-            #           - jnp.sqrt(jnp.sum((g_repr - rotated_random_next_s_repr) ** 2, axis=-1))
-            # qf_pi = (1 - args.gamma) * logits1 + args.gamma * logits2
-            actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
+            qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+
+            actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
 
             return actor_loss, log_prob
 
@@ -629,92 +535,43 @@ if __name__ == "__main__":
 
 
     @jax.jit
-    def update_critic(transitions, training_state):
-        def critic_loss(critic_params, transitions):
-            sa_encoder_params, s_encoder_params, next_s_encoder_params, g_encoder_params, rot_params = (
-                critic_params["sa_encoder"], critic_params["s_encoder"],
-                critic_params["next_s_encoder"], critic_params["g_encoder"],
-                critic_params["rotation"])
+    def update_critic(transitions, training_state, key):
+        def critic_loss(critic_params, transitions, key):
+            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
 
             obs = transitions.observation[:, :args.obs_dim]
-            next_obs = transitions.extras['next_state'][:, args.goal_start_idx:args.goal_end_idx]
             action = transitions.action
-            future_state = transitions.extras["future_state"]
-            goal = future_state[:, args.goal_start_idx:args.goal_end_idx]
+            goal = transitions.extras["future_state"]
+            goal_action = transitions.extras["future_action"]
 
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
-            next_s_repr = next_s_encoder.apply(next_s_encoder_params, next_obs)
-            s_repr = s_encoder.apply(s_encoder_params, obs[:, args.goal_start_idx:args.goal_end_idx])
-            g_repr = g_encoder.apply(g_encoder_params, goal)
-            # rotated_s_repr = rotation.apply(rot_params, s_repr)
-            # rotated_next_s_repr = rotation.apply(rot_params, next_s_repr)
-            # rotated_g_repr = rotation.apply(rot_params, g_repr)
+            g_repr = g_encoder.apply(g_encoder_params, goal, goal_action)
 
-
-            def log_softmax(logits, axis, resubs):
-                if not resubs:
-                    I = jnp.eye(logits.shape[0])
-                    big = 1e6
-                    eps = 1e-6
-                    return logits, -jax.nn.logsumexp(logits - big * I + eps, axis=axis, keepdims=True)
-                else:
-                    return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
-
-            # one-step InfoNCE
-            one_step_logits = -jnp.sqrt(jnp.sum((sa_repr[:, None] - next_s_repr[None, :]) ** 2, axis=-1))  # shape = BxB
-            # one_step_logits = -jnp.sqrt(jnp.sum((sa_repr[:, None] - next_s_repr[None, :]) ** 2, axis=-1))  # shape = BxB
-            # one_step_forward_critic_loss = -jnp.mean(
-            #     jnp.diag(one_step_logits) - jax.nn.logsumexp(one_step_logits, axis=1))
-            # one_step_backward_critic_loss = -jnp.mean(
-            #     jnp.diag(one_step_logits) - jax.nn.logsumexp(one_step_logits, axis=0))
-            # one_step_critic_loss = one_step_forward_critic_loss + one_step_backward_critic_loss
-            l_align1, l_unify1 = log_softmax(one_step_logits, axis=1, resubs=True)
-            l_align2, l_unify2 = log_softmax(one_step_logits, axis=0, resubs=True)
-            one_step_critic_loss = -jnp.mean(jnp.diag(l_align1 + l_unify1) + jnp.diag(l_align2 + l_unify2))
-
-            # multi-step InfoNCE
-            # s_repr = jnp.einsum('jk,ik->ij', rot_params, s_repr)
-            # g_repr = jnp.einsum('jk,ik->ij', rot_params, g_repr)
-            # g_repr = rotation.apply(rot_params, g_repr)
-            multi_step_logits = -jnp.sqrt(jnp.sum((s_repr[:, None] - g_repr[None, :]) ** 2, axis=-1))
-            # multi_step_logits = -jnp.sqrt(jnp.sum((s_repr[:, None] - rotated_g_repr[None, :]) ** 2, axis=-1))
-            multi_step_forward_critic_loss = -jnp.mean(
-                jnp.diag(multi_step_logits) - jax.nn.logsumexp(multi_step_logits, axis=1))
-            # multi_step_backward_critic_loss = -jnp.mean(
-            #     jnp.diag(multi_step_logits) - jax.nn.logsumexp(multi_step_logits, axis=0))
-            # multi_step_critic_loss = multi_step_forward_critic_loss + multi_step_backward_critic_loss
-            multi_step_critic_loss = multi_step_forward_critic_loss
+            # InfoNCE
+            logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
+            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
 
             # logsumexp regularisation
-            # logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-            # critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
-            critic_loss = one_step_critic_loss + multi_step_critic_loss
+            logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
+            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
 
-            I = jnp.eye(one_step_logits.shape[0])
-            one_step_correct = jnp.argmax(one_step_logits, axis=1) == jnp.argmax(I, axis=1)
-            one_step_logits_pos = jnp.sum(one_step_logits * I) / jnp.sum(I)
-            one_step_logits_neg = jnp.sum(one_step_logits * (1 - I)) / jnp.sum(1 - I)
+            I = jnp.eye(logits.shape[0])
+            correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
+            logits_pos = jnp.sum(logits * I) / jnp.sum(I)
+            logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
 
-            multi_step_correct = jnp.argmax(multi_step_logits, axis=1) == jnp.argmax(I, axis=1)
-            multi_step_logits_pos = jnp.sum(multi_step_logits * I) / jnp.sum(I)
-            multi_step_logits_neg = jnp.sum(multi_step_logits * (1 - I)) / jnp.sum(1 - I)
+            return critic_loss, (logsumexp, I, correct, logits_pos, logits_neg)
 
-            return critic_loss, (one_step_correct, one_step_logits_pos, one_step_logits_neg,
-                                 multi_step_correct, multi_step_logits_pos, multi_step_logits_neg)
-
-        (loss, (one_step_correct, one_step_logits_pos, one_step_logits_neg,
-                multi_step_correct, multi_step_logits_pos, multi_step_logits_neg)), grad = jax.value_and_grad(
-            critic_loss, has_aux=True)(training_state.critic_state.params, transitions)
+        (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(critic_loss, has_aux=True)(
+            training_state.critic_state.params, transitions, key)
         new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
         training_state = training_state.replace(critic_state=new_critic_state)
 
         metrics = {
-            "one_step_categorical_accuracy": jnp.mean(one_step_correct),
-            "one_step_logits_pos": one_step_logits_pos,
-            "one_step_logits_neg": one_step_logits_neg,
-            "multi_step_categorical_accuracy": jnp.mean(multi_step_correct),
-            "multi_step_logits_pos": multi_step_logits_pos,
-            "multi_step_logits_neg": multi_step_logits_neg,
+            "categorical_accuracy": jnp.mean(correct),
+            "logits_pos": logits_pos,
+            "logits_neg": logits_neg,
+            "logsumexp": logsumexp.mean(),
             "critic_loss": loss,
         }
 
@@ -724,11 +581,11 @@ if __name__ == "__main__":
     @jax.jit
     def sgd_step(carry, transitions):
         training_state, key = carry
-        key, actor_key, = jax.random.split(key, 2)
+        key, critic_key, actor_key, = jax.random.split(key, 3)
 
         training_state, actor_metrics = update_actor_and_alpha(transitions, training_state, actor_key)
 
-        training_state, critic_metrics = update_critic(transitions, training_state)
+        training_state, critic_metrics = update_critic(transitions, training_state, critic_key)
 
         training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
 
@@ -796,7 +653,7 @@ if __name__ == "__main__":
             return (ts, es, bs, k), metrics
 
         (training_state, env_state, buffer_state, key), metrics = jax.lax.scan(f, (
-            training_state, env_state, buffer_state, key), (), length=args.num_training_steps_per_epoch)
+        training_state, env_state, buffer_state, key), (), length=args.num_training_steps_per_epoch)
 
         metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
         return training_state, env_state, buffer_state, metrics
@@ -875,8 +732,7 @@ if __name__ == "__main__":
             path = f"{save_path}/final_rb.pkl"
             save_params(path, buffer_state)
 
-    render(training_state.actor_state, env, save_path, args.exp_name,
-           wandb_track=args.track)
+    render(training_state.actor_state, env, save_path, args.exp_name)
 
 # (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)
 # 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step 

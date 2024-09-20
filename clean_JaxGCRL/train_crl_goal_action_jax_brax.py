@@ -94,16 +94,27 @@ class SA_encoder(nn.Module):
         else:
             normalize = lambda x: x
 
+        def residual_block(x):
+            res_x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+            res_x = normalize(res_x)
+            res_x = nn.swish(res_x)
+            res_x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(res_x)
+            x = normalize(res_x) + x  # residual connection
+            x = nn.swish(x)
+
+            return x
+
         x = jnp.concatenate([s, a], axis=-1)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-        x = normalize(x)
-        x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-        x = normalize(x)
-        x = nn.swish(x)
+        # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = normalize(x)
+        # x = nn.swish(x)
+        # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = normalize(x)
+        # x = nn.swish(x)
+        x = residual_block(x)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
@@ -159,15 +170,26 @@ class Actor(nn.Module):
         lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
 
+        def residual_block(x):
+            res_x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+            res_x = normalize(res_x)
+            res_x = nn.swish(res_x)
+            res_x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(res_x)
+            x = normalize(res_x) + x  # residual connection
+            x = nn.swish(x)
+
+            return x
+
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-        x = normalize(x)
-        x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-        x = normalize(x)
-        x = nn.swish(x)
+        # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = normalize(x)
+        # x = nn.swish(x)
+        # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = normalize(x)
+        # x = nn.swish(x)
+        x = residual_block(x)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
@@ -180,6 +202,70 @@ class Actor(nn.Module):
                     log_std + 1)  # From SpinUp / Denis Yarats
 
         return mean, log_std
+
+class RotationMatrix(nn.Module):
+    repr_dim: int = 64
+    ortho_rot: bool = False
+
+    # def setup(self):
+    #     self.rotation = self.param('rotation', lambda key, shape: jnp.eye(shape[0], dtype=jnp.float32),
+    #                                 (self.repr_dim, self.repr_dim))
+    @nn.compact
+    def __call__(self, s_repr):
+        # if self.ortho_rot:
+        #     I = jnp.eye(self.repr_dim)
+        #     rotation = self.rotation - self.rotation.T
+        #     rotation = (I + rotation) @ jnp.linalg.inv(I - rotation)
+        # else:
+        #     rotation = self.rotation
+
+        # s_repr = jnp.einsum('jk,ik->ij', rotation, s_repr)
+
+        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
+        s_repr = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, use_bias=False)(s_repr)
+
+        return s_repr
+
+
+class Projection(nn.Module):
+    repr_dim: int = 64
+    norm_type: str = "layer_norm"
+    @nn.compact
+    def __call__(self, sa_repr):
+        if self.norm_type == "layer_norm":
+            normalize = lambda x: nn.LayerNorm()(x)
+        else:
+            normalize = lambda x: x
+
+        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
+        bias_init = nn.initializers.zeros
+
+        def residual_block(x):
+            res_x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+            res_x = normalize(res_x)
+            res_x = nn.swish(res_x)
+            res_x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(res_x)
+            x = normalize(res_x) + x  # residual connection
+            x = nn.swish(x)
+
+            return x
+
+        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(sa_repr)
+        x = normalize(x)
+        x = nn.swish(x)
+        # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = normalize(x)
+        # x = nn.swish(x)
+        # x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = normalize(x) + sa_repr  # residual connection
+        # x = nn.swish(x)
+        x = residual_block(x)
+        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = normalize(x)
+        x = nn.swish(x)
+        x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+
+        return x
 
 
 @flax.struct.dataclass
@@ -213,7 +299,8 @@ def save_params(path: str, params: Any):
         fout.write(pickle.dumps(params))
 
 
-def render(actor_state, env, exp_dir, exp_name, deterministic=True):
+def render(actor_state, env, exp_dir, exp_name, deterministic=True,
+           wandb_track=False):
     def actor_sample(observations, key, deterministic=deterministic):
         means, log_stds = actor.apply(actor_state.params, observations)
         if deterministic:
@@ -246,7 +333,8 @@ def render(actor_state, env, exp_dir, exp_name, deterministic=True):
     url = html.render(env.sys.replace(dt=env.dt), rollout, height=480)
     with open(os.path.join(exp_dir, f"{exp_name}.html"), "w") as file:
         file.write(url)
-    wandb.log({"render": wandb.Html(url)})
+    if wandb_track:
+        wandb.log({"render": wandb.Html(url)})
 
 
 if __name__ == "__main__":
@@ -292,7 +380,7 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, buffer_key, env_key, eval_env_key, actor_key, sa_key, g_key = jax.random.split(key, 7)
+    key, buffer_key, env_key, eval_env_key, actor_key, sa_key, g_key, rot_key = jax.random.split(key, 8)
 
     # Environment setup    
     if args.env_id == "ant":
@@ -349,11 +437,15 @@ if __name__ == "__main__":
     sa_encoder = SA_encoder(repr_dim=args.repr_dim)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
     g_encoder = SA_encoder(repr_dim=args.repr_dim)
-    g_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
+    g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
+    rotation = Projection(repr_dim=args.repr_dim)
+    rot_params = rotation.init(rot_key, np.ones([1, args.repr_dim]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
-        params={"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params},
+        params={"sa_encoder": sa_encoder_params,
+                "g_encoder": g_encoder_params,
+                "rotation": rot_params},
         tx=optax.adam(learning_rate=args.critic_lr),
     )
 
@@ -489,7 +581,7 @@ if __name__ == "__main__":
             goal = transitions.extras["future_state"]
             goal_action = transitions.extras["future_action"]
             # goal = future_state[:, args.goal_start_idx: args.goal_end_idx]
-            observation = jnp.concatenate([state, goal], axis=1)
+            observation = jnp.concatenate([state, goal[:, args.goal_start_idx: args.goal_end_idx]], axis=1)
 
             means, log_stds = actor.apply(actor_params, observation)
             stds = jnp.exp(log_stds)
@@ -499,9 +591,12 @@ if __name__ == "__main__":
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
+            sa_encoder_params, g_encoder_params, rot_params = (
+                critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["rotation"])
             sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
-            g_repr = g_encoder.apply(g_encoder_params, goal, goal_action)
+            # sa_repr = rotation.apply(rot_params, sa_repr)
+            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            g_repr = rotation.apply(rot_params, jax.lax.stop_gradient(g_repr))
 
             qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
@@ -537,7 +632,8 @@ if __name__ == "__main__":
     @jax.jit
     def update_critic(transitions, training_state, key):
         def critic_loss(critic_params, transitions, key):
-            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
+            sa_encoder_params, g_encoder_params, rot_params = (
+                critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["rotation"])
 
             obs = transitions.observation[:, :args.obs_dim]
             action = transitions.action
@@ -545,7 +641,9 @@ if __name__ == "__main__":
             goal_action = transitions.extras["future_action"]
 
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
-            g_repr = g_encoder.apply(g_encoder_params, goal, goal_action)
+            # sa_repr = rotation.apply(rot_params, sa_repr)
+            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            g_repr = rotation.apply(rot_params, jax.lax.stop_gradient(g_repr))
 
             # InfoNCE
             logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
@@ -732,7 +830,8 @@ if __name__ == "__main__":
             path = f"{save_path}/final_rb.pkl"
             save_params(path, buffer_state)
 
-    render(training_state.actor_state, env, save_path, args.exp_name)
+    render(training_state.actor_state, env, save_path, args.exp_name,
+           wandb_track=args.track)
 
 # (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)
 # 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step 

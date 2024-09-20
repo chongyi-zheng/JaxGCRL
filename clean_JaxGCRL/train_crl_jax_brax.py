@@ -213,7 +213,8 @@ def save_params(path: str, params: Any):
         fout.write(pickle.dumps(params))
 
 
-def render(actor_state, env, exp_dir, exp_name, deterministic=True):
+def render(actor_state, env, exp_dir, exp_name, deterministic=True,
+           wandb_track=False):
     def actor_sample(observations, key, deterministic=deterministic):
         means, log_stds = actor.apply(actor_state.params, observations)
         if deterministic:
@@ -246,7 +247,8 @@ def render(actor_state, env, exp_dir, exp_name, deterministic=True):
     url = html.render(env.sys.replace(dt=env.dt), rollout, height=480)
     with open(os.path.join(exp_dir, f"{exp_name}.html"), "w") as file:
         file.write(url)
-    wandb.log({"render": wandb.Html(url)})
+    if wandb_track:
+        wandb.log({"render": wandb.Html(url)})
 
 
 if __name__ == "__main__":
@@ -729,7 +731,8 @@ if __name__ == "__main__":
             path = f"{save_path}/final_rb.pkl"
             save_params(path, buffer_state)
 
-    render(training_state.actor_state, env, save_path, args.exp_name)
+    render(training_state.actor_state, env, save_path, args.exp_name,
+           wandb_track=args.track)
 
 # (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)
 # 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step 

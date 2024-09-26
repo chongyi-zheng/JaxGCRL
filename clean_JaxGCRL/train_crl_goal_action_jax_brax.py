@@ -150,6 +150,7 @@ class G_encoder(nn.Module):
         x = normalize(x)
         x = nn.swish(x)
         x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+
         return x
 
 
@@ -436,7 +437,7 @@ if __name__ == "__main__":
     # Critic
     sa_encoder = SA_encoder(repr_dim=args.repr_dim)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    g_encoder = SA_encoder(repr_dim=args.repr_dim)
+    g_encoder = G_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
     projection = Projection(repr_dim=args.repr_dim)
     proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
@@ -594,9 +595,9 @@ if __name__ == "__main__":
             sa_encoder_params, g_encoder_params, proj_params = (
                 critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
             sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
-            # sa_repr = rotation.apply(rot_params, sa_repr)
+            # sa_repr = projection.apply(proj_params, sa_repr)
             g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
-            g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
+            g_repr = projection.apply(proj_params, g_repr)
 
             qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
@@ -641,13 +642,17 @@ if __name__ == "__main__":
             goal_action = transitions.extras["future_action"]
 
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
-            # sa_repr = rotation.apply(rot_params, sa_repr)
+            # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(sa_repr))
             g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            # g_repr = jax.lax.stop_gradient(g_repr)
             g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
 
             # InfoNCE
-            logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
-            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+            logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = B x B
+            # forward infonce
+            # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+            # backward infonce
+            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=0))
 
             # logsumexp regularisation
             logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)

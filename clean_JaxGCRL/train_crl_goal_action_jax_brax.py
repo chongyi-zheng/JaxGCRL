@@ -438,14 +438,14 @@ if __name__ == "__main__":
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
     g_encoder = SA_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    rotation = Projection(repr_dim=args.repr_dim)
-    rot_params = rotation.init(rot_key, np.ones([1, args.repr_dim]))
+    projection = Projection(repr_dim=args.repr_dim)
+    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
         params={"sa_encoder": sa_encoder_params,
                 "g_encoder": g_encoder_params,
-                "rotation": rot_params},
+                "projection": proj_params},
         tx=optax.adam(learning_rate=args.critic_lr),
     )
 
@@ -591,12 +591,12 @@ if __name__ == "__main__":
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sa_encoder_params, g_encoder_params, rot_params = (
-                critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["rotation"])
+            sa_encoder_params, g_encoder_params, proj_params = (
+                critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
             sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             # sa_repr = rotation.apply(rot_params, sa_repr)
             g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
-            g_repr = rotation.apply(rot_params, jax.lax.stop_gradient(g_repr))
+            g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
 
             qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
@@ -632,8 +632,8 @@ if __name__ == "__main__":
     @jax.jit
     def update_critic(transitions, training_state, key):
         def critic_loss(critic_params, transitions, key):
-            sa_encoder_params, g_encoder_params, rot_params = (
-                critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["rotation"])
+            sa_encoder_params, g_encoder_params, proj_params = (
+                critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
 
             obs = transitions.observation[:, :args.obs_dim]
             action = transitions.action
@@ -643,7 +643,7 @@ if __name__ == "__main__":
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
             # sa_repr = rotation.apply(rot_params, sa_repr)
             g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
-            g_repr = rotation.apply(rot_params, jax.lax.stop_gradient(g_repr))
+            g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
 
             # InfoNCE
             logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB

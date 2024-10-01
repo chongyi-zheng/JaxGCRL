@@ -243,7 +243,7 @@ class Projection(nn.Module):
     repr_dim: int = 64
     norm_type: str = "layer_norm"
     @nn.compact
-    def __call__(self, s_repr, action):
+    def __call__(self, sa_repr):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
@@ -262,8 +262,8 @@ class Projection(nn.Module):
 
             return x
 
-        x = jnp.concatenate([s_repr, action], axis=-1)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = jnp.concatenate([s_repr, action], axis=-1)
+        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(sa_repr)
         x = normalize(x)
         x = nn.swish(x)
         # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
@@ -452,7 +452,8 @@ if __name__ == "__main__":
     g_encoder = G_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]))
     projection = Projection(repr_dim=args.repr_dim)
-    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]), np.ones([1, action_size]))
+    # proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]), np.ones([1, action_size]))
+    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
@@ -606,13 +607,13 @@ if __name__ == "__main__":
 
             sa_encoder_params, g_encoder_params, proj_params = (
                 critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
-            s_repr = g_encoder.apply(g_encoder_params, state)
-            sa_repr = projection.apply(proj_params, s_repr, action)
-            g_repr = g_encoder.apply(g_encoder_params, goal)
-            # sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+            # s_repr = g_encoder.apply(g_encoder_params, state)
+            # sa_repr = projection.apply(proj_params, s_repr, action)
+            # g_repr = g_encoder.apply(g_encoder_params, goal)
+            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             # sa_repr = projection.apply(proj_params, sa_repr)
-            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
-            # g_repr = projection.apply(proj_params, g_repr)
+            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            g_repr = projection.apply(proj_params, g_repr)
 
             qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
@@ -656,14 +657,15 @@ if __name__ == "__main__":
             goal = transitions.extras["future_state"]
             goal_action = transitions.extras["future_action"]
 
-            s_repr = g_encoder.apply(g_encoder_params, obs)
-            sa_repr = projection.apply(proj_params, s_repr, action)
-            g_repr = g_encoder.apply(g_encoder_params, goal)
-            g_repr = jax.lax.stop_gradient(g_repr)
-            # sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
-            # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(sa_repr))
-            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            # s_repr = g_encoder.apply(g_encoder_params, obs)
+            # sa_repr = projection.apply(proj_params, s_repr, action)
+            # g_repr = g_encoder.apply(g_encoder_params, goal)
             # g_repr = jax.lax.stop_gradient(g_repr)
+            sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
+            # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(sa_repr))
+            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            # g_repr = jax.lax.stop_gradient(g_repr)
+            g_repr = projection.apply(proj_params, g_repr)
             # g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
 
             # InfoNCE

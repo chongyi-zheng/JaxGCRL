@@ -137,15 +137,26 @@ class G_encoder(nn.Module):
         else:
             normalize = lambda x: x
 
+        def residual_block(x):
+            res_x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+            res_x = normalize(res_x)
+            res_x = nn.swish(res_x)
+            res_x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(res_x)
+            x = normalize(res_x) + x  # residual connection
+            x = nn.swish(x)
+
+            return x
+
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(g)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-        x = normalize(x)
-        x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-        x = normalize(x)
-        x = nn.swish(x)
+        # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = normalize(x)
+        # x = nn.swish(x)
+        # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = normalize(x)
+        # x = nn.swish(x)
+        x = residual_block(x)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
@@ -232,7 +243,7 @@ class Projection(nn.Module):
     repr_dim: int = 64
     norm_type: str = "layer_norm"
     @nn.compact
-    def __call__(self, sa_repr):
+    def __call__(self, s_repr, action):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
@@ -251,7 +262,8 @@ class Projection(nn.Module):
 
             return x
 
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(sa_repr)
+        x = jnp.concatenate([s_repr, action], axis=-1)
+        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
         # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
@@ -438,9 +450,9 @@ if __name__ == "__main__":
     sa_encoder = SA_encoder(repr_dim=args.repr_dim)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
     g_encoder = G_encoder(repr_dim=args.repr_dim)
-    g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
+    g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]))
     projection = Projection(repr_dim=args.repr_dim)
-    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
+    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]), np.ones([1, action_size]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
@@ -594,10 +606,13 @@ if __name__ == "__main__":
 
             sa_encoder_params, g_encoder_params, proj_params = (
                 critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
-            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+            s_repr = g_encoder.apply(g_encoder_params, state)
+            sa_repr = projection.apply(proj_params, s_repr, action)
+            g_repr = g_encoder.apply(g_encoder_params, goal)
+            # sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             # sa_repr = projection.apply(proj_params, sa_repr)
-            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
-            g_repr = projection.apply(proj_params, g_repr)
+            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            # g_repr = projection.apply(proj_params, g_repr)
 
             qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
@@ -641,18 +656,22 @@ if __name__ == "__main__":
             goal = transitions.extras["future_state"]
             goal_action = transitions.extras["future_action"]
 
-            sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
+            s_repr = g_encoder.apply(g_encoder_params, obs)
+            sa_repr = projection.apply(proj_params, s_repr, action)
+            g_repr = g_encoder.apply(g_encoder_params, goal)
+            g_repr = jax.lax.stop_gradient(g_repr)
+            # sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
             # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(sa_repr))
-            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
             # g_repr = jax.lax.stop_gradient(g_repr)
-            g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
+            # g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
 
             # InfoNCE
             logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = B x B
             # forward infonce
-            # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
             # backward infonce
-            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=0))
+            # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=0))
 
             # logsumexp regularisation
             logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)

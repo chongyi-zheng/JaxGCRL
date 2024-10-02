@@ -173,7 +173,7 @@ class Actor(nn.Module):
     log_std_min: int = -5
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, s_repr, g_repr):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
@@ -192,6 +192,7 @@ class Actor(nn.Module):
 
             return x
 
+        x = jnp.concatenate([s_repr, g_repr], axis=-1)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
@@ -243,7 +244,7 @@ class Projection(nn.Module):
     repr_dim: int = 64
     norm_type: str = "layer_norm"
     @nn.compact
-    def __call__(self, sa_repr):
+    def __call__(self, s_repr, action):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
@@ -262,15 +263,15 @@ class Projection(nn.Module):
 
             return x
 
-        # x = jnp.concatenate([s_repr, action], axis=-1)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(sa_repr)
+        x = jnp.concatenate([s_repr, action], axis=-1)
+        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
         # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         # x = normalize(x)
         # x = nn.swish(x)
         # x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-        # x = normalize(x) + sa_repr  # residual connection
+        # x = normalize(x)
         # x = nn.swish(x)
         x = residual_block(x)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
@@ -312,10 +313,16 @@ def save_params(path: str, params: Any):
         fout.write(pickle.dumps(params))
 
 
-def render(actor_state, env, exp_dir, exp_name, deterministic=True,
+def render(training_state, env, exp_dir, exp_name, deterministic=True,
            wandb_track=False):
     def actor_sample(observations, key, deterministic=deterministic):
-        means, log_stds = actor.apply(actor_state.params, observations)
+        state, g = observations[:, :args.obs_dim], observations[:, args.obs_dim:]
+        goal = jnp.zeros_like(state)
+        goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
+        s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
+        g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+
+        means, log_stds = actor.apply(training_state.actor_state.params, s_repr, g_repr)
         if deterministic:
             actions = nn.tanh(means)
         else:
@@ -442,7 +449,7 @@ if __name__ == "__main__":
     actor = Actor(action_size=action_size)
     actor_state = TrainState.create(
         apply_fn=actor.apply,
-        params=actor.init(actor_key, np.ones([1, obs_size])),
+        params=actor.init(actor_key, np.ones([1, args.repr_dim]), np.ones([1, args.repr_dim])),
         tx=optax.adam(learning_rate=args.actor_lr)
     )
 
@@ -452,8 +459,8 @@ if __name__ == "__main__":
     g_encoder = G_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]))
     projection = Projection(repr_dim=args.repr_dim)
-    # proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]), np.ones([1, action_size]))
-    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
+    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]), np.ones([1, action_size]))
+    # proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
@@ -518,7 +525,13 @@ if __name__ == "__main__":
 
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
-        means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
+        state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
+        goal = jnp.zeros_like(state)
+        goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
+        s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
+        g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+
+        means, _ = actor.apply(training_state.actor_state.params, s_repr, g_repr)
         actions = nn.tanh(means)
 
         nstate = env.step(env_state, actions)
@@ -533,8 +546,14 @@ if __name__ == "__main__":
         )
 
 
-    def actor_step(actor_state, env, env_state, key, extra_fields):
-        means, log_stds = actor.apply(actor_state.params, env_state.obs)
+    def actor_step(training_state, env, env_state, key, extra_fields):
+        state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
+        goal = jnp.zeros_like(state)
+        goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
+        s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
+        g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+
+        means, log_stds = actor.apply(training_state.actor_state.params, s_repr, g_repr)
         stds = jnp.exp(log_stds)
         actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
 
@@ -551,12 +570,12 @@ if __name__ == "__main__":
 
 
     @jax.jit
-    def get_experience(actor_state, env_state, buffer_state, key):
+    def get_experience(training_state, env_state, buffer_state, key):
         @jax.jit
         def f(carry, unused_t):
             env_state, current_key = carry
             current_key, next_key = jax.random.split(current_key)
-            env_state, transition = actor_step(actor_state, env, env_state, current_key,
+            env_state, transition = actor_step(training_state, env, env_state, current_key,
                                                extra_fields=("truncation", "seed"))
             return (env_state, next_key), transition
 
@@ -573,7 +592,7 @@ if __name__ == "__main__":
             training_state, env_state, buffer_state, key = carry
             key, new_key = jax.random.split(key)
             env_state, buffer_state = get_experience(
-                training_state.actor_state,
+                training_state,
                 env_state,
                 buffer_state,
                 key,
@@ -595,9 +614,12 @@ if __name__ == "__main__":
             goal = transitions.extras["future_state"]
             goal_action = transitions.extras["future_action"]
             # goal = future_state[:, args.goal_start_idx: args.goal_end_idx]
-            observation = jnp.concatenate([state, goal[:, args.goal_start_idx: args.goal_end_idx]], axis=1)
+            observation = jnp.concatenate([state, goal[:, args.goal_start_idx:args.goal_end_idx]], axis=1)
 
-            means, log_stds = actor.apply(actor_params, observation)
+            s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
+            g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+
+            means, log_stds = actor.apply(actor_params, s_repr, g_repr)
             stds = jnp.exp(log_stds)
             x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
             action = nn.tanh(x_ts)
@@ -607,13 +629,13 @@ if __name__ == "__main__":
 
             sa_encoder_params, g_encoder_params, proj_params = (
                 critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
-            # s_repr = g_encoder.apply(g_encoder_params, state)
-            # sa_repr = projection.apply(proj_params, s_repr, action)
-            # g_repr = g_encoder.apply(g_encoder_params, goal)
-            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+            s_repr = g_encoder.apply(g_encoder_params, state)
+            sa_repr = projection.apply(proj_params, s_repr, action)
+            g_repr = g_encoder.apply(g_encoder_params, goal)
+            # sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             # sa_repr = projection.apply(proj_params, sa_repr)
-            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
-            g_repr = projection.apply(proj_params, g_repr)
+            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            # g_repr = projection.apply(proj_params, g_repr)
 
             qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
@@ -657,15 +679,15 @@ if __name__ == "__main__":
             goal = transitions.extras["future_state"]
             goal_action = transitions.extras["future_action"]
 
-            # s_repr = g_encoder.apply(g_encoder_params, obs)
-            # sa_repr = projection.apply(proj_params, s_repr, action)
-            # g_repr = g_encoder.apply(g_encoder_params, goal)
+            s_repr = g_encoder.apply(g_encoder_params, obs)
+            sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(s_repr), action)
+            g_repr = g_encoder.apply(g_encoder_params, goal)
             # g_repr = jax.lax.stop_gradient(g_repr)
-            sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
+            # sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
             # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(sa_repr))
-            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
             # g_repr = jax.lax.stop_gradient(g_repr)
-            g_repr = projection.apply(proj_params, g_repr)
+            # g_repr = projection.apply(proj_params, g_repr)
             # g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
 
             # InfoNCE
@@ -726,7 +748,7 @@ if __name__ == "__main__":
 
         # update buffer
         env_state, buffer_state = get_experience(
-            training_state.actor_state,
+            training_state,
             env_state,
             buffer_state,
             experience_key1,
@@ -856,7 +878,7 @@ if __name__ == "__main__":
             path = f"{save_path}/final_rb.pkl"
             save_params(path, buffer_state)
 
-    render(training_state.actor_state, env, save_path, args.exp_name,
+    render(training_state, env, save_path, args.exp_name,
            wandb_track=args.track)
 
 # (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)

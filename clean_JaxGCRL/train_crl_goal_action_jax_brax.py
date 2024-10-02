@@ -173,7 +173,8 @@ class Actor(nn.Module):
     log_std_min: int = -5
 
     @nn.compact
-    def __call__(self, s_repr, g_repr):
+    def __call__(self, x):
+    # def __call__(self, s_repr, g_repr):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
@@ -192,7 +193,7 @@ class Actor(nn.Module):
 
             return x
 
-        x = jnp.concatenate([s_repr, g_repr], axis=-1)
+        # x = jnp.concatenate([s_repr, g_repr], axis=-1)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
@@ -244,7 +245,8 @@ class Projection(nn.Module):
     repr_dim: int = 64
     norm_type: str = "layer_norm"
     @nn.compact
-    def __call__(self, s_repr, action):
+    def __call__(self, sa_repr):
+    # def __call__(self, s_repr, action):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
@@ -263,8 +265,8 @@ class Projection(nn.Module):
 
             return x
 
-        x = jnp.concatenate([s_repr, action], axis=-1)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = jnp.concatenate([s_repr, action], axis=-1)
+        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(sa_repr)
         x = normalize(x)
         x = nn.swish(x)
         # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
@@ -316,13 +318,14 @@ def save_params(path: str, params: Any):
 def render(training_state, env, exp_dir, exp_name, deterministic=True,
            wandb_track=False):
     def actor_sample(observations, key, deterministic=deterministic):
-        state, g = observations[:, :args.obs_dim], observations[:, args.obs_dim:]
-        goal = jnp.zeros_like(state)
-        goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
-        s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
-        g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+        # state, g = observations[:, :args.obs_dim], observations[:, args.obs_dim:]
+        # goal = jnp.zeros_like(state)
+        # goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
+        # s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
+        # g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
 
-        means, log_stds = actor.apply(training_state.actor_state.params, s_repr, g_repr)
+        # means, log_stds = actor.apply(training_state.actor_state.params, s_repr, g_repr)
+        means, log_stds = actor.apply(training_state.actor_state.params, observations)
         if deterministic:
             actions = nn.tanh(means)
         else:
@@ -449,7 +452,8 @@ if __name__ == "__main__":
     actor = Actor(action_size=action_size)
     actor_state = TrainState.create(
         apply_fn=actor.apply,
-        params=actor.init(actor_key, np.ones([1, args.repr_dim]), np.ones([1, args.repr_dim])),
+        # params=actor.init(actor_key, np.ones([1, args.repr_dim]), np.ones([1, args.repr_dim])),
+        params=actor.init(actor_key, np.ones([1, obs_size])),
         tx=optax.adam(learning_rate=args.actor_lr)
     )
 
@@ -459,7 +463,7 @@ if __name__ == "__main__":
     g_encoder = G_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]))
     projection = Projection(repr_dim=args.repr_dim)
-    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]), np.ones([1, action_size]))
+    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
     # proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
@@ -525,13 +529,14 @@ if __name__ == "__main__":
 
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
-        state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
-        goal = jnp.zeros_like(state)
-        goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
-        s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
-        g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+        # state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
+        # goal = jnp.zeros_like(state)
+        # goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
+        # s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
+        # g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
 
-        means, _ = actor.apply(training_state.actor_state.params, s_repr, g_repr)
+        # means, _ = actor.apply(training_state.actor_state.params, s_repr, g_repr)
+        means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
         actions = nn.tanh(means)
 
         nstate = env.step(env_state, actions)
@@ -547,13 +552,14 @@ if __name__ == "__main__":
 
 
     def actor_step(training_state, env, env_state, key, extra_fields):
-        state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
-        goal = jnp.zeros_like(state)
-        goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
-        s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
-        g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+        # state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
+        # goal = jnp.zeros_like(state)
+        # goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
+        # s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
+        # g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
 
-        means, log_stds = actor.apply(training_state.actor_state.params, s_repr, g_repr)
+        # means, log_stds = actor.apply(training_state.actor_state.params, s_repr, g_repr)
+        means, log_stds = actor.apply(training_state.actor_state.params, env_state.obs)
         stds = jnp.exp(log_stds)
         actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
 
@@ -616,10 +622,11 @@ if __name__ == "__main__":
             # goal = future_state[:, args.goal_start_idx: args.goal_end_idx]
             observation = jnp.concatenate([state, goal[:, args.goal_start_idx:args.goal_end_idx]], axis=1)
 
-            s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
-            g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+            # s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
+            # g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
 
-            means, log_stds = actor.apply(actor_params, s_repr, g_repr)
+            # means, log_stds = actor.apply(actor_params, s_repr, g_repr)
+            means, log_stds = actor.apply(actor_params, obs)
             stds = jnp.exp(log_stds)
             x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
             action = nn.tanh(x_ts)
@@ -629,13 +636,13 @@ if __name__ == "__main__":
 
             sa_encoder_params, g_encoder_params, proj_params = (
                 critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
-            s_repr = g_encoder.apply(g_encoder_params, state)
-            sa_repr = projection.apply(proj_params, s_repr, action)
-            g_repr = g_encoder.apply(g_encoder_params, goal)
-            # sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+            # s_repr = g_encoder.apply(g_encoder_params, state)
+            # sa_repr = projection.apply(proj_params, s_repr, action)
+            # g_repr = g_encoder.apply(g_encoder_params, goal)
+            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             # sa_repr = projection.apply(proj_params, sa_repr)
-            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
-            # g_repr = projection.apply(proj_params, g_repr)
+            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            g_repr = projection.apply(proj_params, g_repr)
 
             qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
@@ -678,24 +685,34 @@ if __name__ == "__main__":
             action = transitions.action
             goal = transitions.extras["future_state"]
             goal_action = transitions.extras["future_action"]
+            rand_goal = jnp.roll(goal, shift=1, axis=0)
+            rand_goal_action = jnp.roll(goal_action, shift=1, axis=0)
 
-            s_repr = g_encoder.apply(g_encoder_params, obs)
-            sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(s_repr), action)
-            g_repr = g_encoder.apply(g_encoder_params, goal)
+            # s_repr = g_encoder.apply(g_encoder_params, obs)
+            # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(s_repr), action)
+            # g_repr = g_encoder.apply(g_encoder_params, goal)
             # g_repr = jax.lax.stop_gradient(g_repr)
-            # sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
+            sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
             # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(sa_repr))
-            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
             # g_repr = jax.lax.stop_gradient(g_repr)
             # g_repr = projection.apply(proj_params, g_repr)
-            # g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
+            g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
+            rand_g_repr = sa_encoder.apply(sa_encoder_params, rand_goal, rand_goal_action)
+            rand_g_repr = projection.apply(proj_params, jax.lax.stop_gradient(rand_g_repr))
 
             # InfoNCE
             logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = B x B
+            logits_no_resubs = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - rand_g_repr[None, :, :]) ** 2, axis=-1))
             # forward infonce
             critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
             # backward infonce
             # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=0))
+            # forward infonce without diagonal terms
+            # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits_no_resubs, axis=0))
+            # symmetric infonce without diagonal terms
+            # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits_no_resubs, axis=0))
+            # critic_loss += -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits_no_resubs, axis=1))
 
             # logsumexp regularisation
             logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)

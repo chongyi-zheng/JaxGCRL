@@ -708,7 +708,7 @@ if __name__ == "__main__":
             # logits_no_resubs = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - rand_g_repr[None, :, :]) ** 2, axis=-1))
             # logits_no_resubs = jnp.fill_diagonal(logits, -jnp.inf, inplace=False)
             # forward infonce
-            critic_loss = -jnp.mean(jnp.diag(logits) - 0.5 * jax.nn.logsumexp(logits, axis=1))
+            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
             # backward infonce
             # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=0))
             # forward infonce without diagonal terms

@@ -23,10 +23,12 @@ from wandb_osh.hooks import TriggerWandbSyncHook
 
 from buffer import TrajectoryUniformSamplingQueue
 from evaluator import CrlEvaluator
+from planning import bellman_ford, get_shortest_path
 
 
 @dataclass
 class Args:
+    debug: bool = False
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     seed: int = 1
     torch_deterministic: bool = True
@@ -67,6 +69,12 @@ class Args:
     min_replay_size: int = 1000
 
     unroll_length: int = 62
+    """max distance of edges on the planning graph"""
+    max_edge_dist: float = 4.0
+    """open-loop or close-loop planning"""
+    open_loop: bool = True
+    """number of candidate waypoints"""
+    num_candidates: int = 1000
 
     # to be filled in runtime
     env_steps_per_actor_step: int = 0
@@ -302,6 +310,19 @@ class Transition(NamedTuple):
     discount: jnp.ndarray
     extras: jnp.ndarray = ()
 
+@flax.struct.dataclass
+class PlanningState:
+    """Contains for planning state for the planner"""
+    shortest_path: jnp.ndarray
+    shortest_dists: jnp.ndarray
+    start_idx: jnp.ndarray
+    w_counter: jnp.ndarray
+    init_waypoint_obs: jnp.ndarray
+    init_w_repr: jnp.ndarray
+    init_projected_w_repr: jnp.ndarray
+    init_sw_dists: jnp.ndarray
+    init_wg_dists: jnp.ndarray
+
 
 def load_params(path: str):
     with epath.Path(path).open('rb') as fin:
@@ -360,10 +381,7 @@ def render(training_state, env, exp_dir, exp_name, deterministic=True,
         wandb.log({"render": wandb.Html(url)})
 
 
-if __name__ == "__main__":
-
-    args = tyro.cli(Args)
-
+def main(args):
     args.env_steps_per_actor_step = args.num_envs * args.unroll_length
     args.num_prefill_env_steps = args.min_replay_size * args.num_envs
     args.num_prefill_actor_steps = np.ceil(args.min_replay_size / args.unroll_length)
@@ -405,7 +423,7 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
     key, buffer_key, env_key, eval_env_key, actor_key, sa_key, g_key, rot_key = jax.random.split(key, 8)
 
-    # Environment setup    
+    # Environment setup
     if args.env_id == "ant":
         from envs.ant import Ant
 
@@ -492,6 +510,19 @@ if __name__ == "__main__":
         alpha_state=alpha_state,
     )
 
+    # Planning State
+    planning_state = PlanningState(
+        shortest_path=jnp.zeros((args.num_envs, args.num_candidates + 2), dtype=jnp.int32),
+        shortest_dists=jnp.zeros((args.num_envs, args.num_candidates + 2), dtype=jnp.float32),
+        start_idx=jnp.zeros((args.num_envs, ), dtype=jnp.int32),
+        w_counter=jnp.zeros((args.num_envs, ), dtype=jnp.int32),
+        init_waypoint_obs=jnp.zeros((args.num_envs, args.num_candidates, args.obs_dim), dtype=jnp.float32),
+        init_w_repr=jnp.zeros((args.num_envs, args.num_candidates, args.repr_dim), dtype=jnp.float32),
+        init_projected_w_repr=jnp.zeros((args.num_envs, args.num_candidates, args.repr_dim), dtype=jnp.float32),
+        init_sw_dists=jnp.zeros((args.num_envs, args.num_candidates), dtype=jnp.float32),
+        init_wg_dists=jnp.zeros((args.num_envs, args.num_candidates), dtype=jnp.float32),
+    )
+
     # Replay Buffer
     dummy_obs = jnp.zeros((obs_size,))
     dummy_action = jnp.zeros((action_size,))
@@ -509,12 +540,10 @@ if __name__ == "__main__":
         },
     )
 
-
     def jit_wrap(buffer):
         buffer.insert_internal = jax.jit(buffer.insert_internal)
         buffer.sample_internal = jax.jit(buffer.sample_internal)
         return buffer
-
 
     replay_buffer = jit_wrap(
         TrajectoryUniformSamplingQueue(
@@ -527,6 +556,10 @@ if __name__ == "__main__":
     )
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
+    def energy_fn(x, y):
+        energy = -jnp.sqrt(jnp.sum((x[:, None, :] - y[None, :, :]) ** 2, axis=-1))
+
+        return energy
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         # state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
@@ -550,13 +583,15 @@ if __name__ == "__main__":
             extras={"state_extras": state_extras},
         )
 
-
     def actor_step(training_state, env, env_state, key, extra_fields):
         # state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
         # goal = jnp.zeros_like(state)
         # goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
         # s_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], state)
         # g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+        # obs = env_state.obs[:, :args.obs_dim]
+        # goal = env_state.info["waypoint"]
+        # obs_and_goal = jnp.concatenate([obs, goal], axis=-1)
 
         # means, log_stds = actor.apply(training_state.actor_state.params, s_repr, g_repr)
         means, log_stds = actor.apply(training_state.actor_state.params, env_state.obs)
@@ -574,43 +609,201 @@ if __name__ == "__main__":
             extras={"state_extras": state_extras},
         )
 
+    def search_waypoint(training_state, waypoint_transitions, env_state, planning_state):
+        # (shortest_path, shortest_dist, start_idx, w_counter,
+        #  init_waypoint_obs, init_w_repr, init_projected_w_repr,
+        #  init_sw_dists, init_wg_dists) = planning_state
+
+        # compute representations
+        waypoint_obs = waypoint_transitions.observation[:, :args.obs_dim]
+        waypoint_action = waypoint_transitions.action
+        state, g = env_state.obs[:args.obs_dim], env_state.obs[args.obs_dim:]
+        goal = jnp.zeros_like(state)
+        goal = goal.at[args.goal_start_idx:args.goal_end_idx].set(g)
+        dummy_action = jnp.zeros((action_size, ))
+        s_repr = sa_encoder.apply(training_state.critic_state.params["sa_encoder"],
+                                  state, dummy_action)
+        g_repr = sa_encoder.apply(training_state.critic_state.params["sa_encoder"],
+                                  goal, dummy_action)
+        projected_g_repr = projection.apply(training_state.critic_state.params["projection"], g_repr)
+        w_repr = sa_encoder.apply(training_state.critic_state.params["sa_encoder"],
+                                  waypoint_obs, waypoint_action)
+        projected_w_repr = projection.apply(training_state.critic_state.params["projection"], w_repr)
+
+        # compute representation distances
+        w_pdists = -energy_fn(w_repr, projected_w_repr)
+        w_pdists = jnp.where((w_pdists < args.max_edge_dist), w_pdists, jnp.inf)
+        sw_dists = -energy_fn(s_repr[None], projected_w_repr).squeeze()
+        sw_dists = jnp.where(sw_dists < args.max_edge_dist, sw_dists, jnp.inf)
+        wg_dists = -energy_fn(w_repr, projected_g_repr[None]).squeeze()
+        wg_dists = jnp.where(wg_dists < args.max_edge_dist, wg_dists, jnp.inf)
+        sg_dist = -energy_fn(s_repr[None], projected_g_repr[None]).squeeze()
+
+        if args.open_loop:
+            def update_ps(planning_state):
+                """compute shortest path"""
+                # construct adjacency matrix
+                adj = jnp.full((args.num_candidates + 2, args.num_candidates + 2), jnp.inf)
+                adj = jnp.fill_diagonal(adj, 0, inplace=False)
+                adj = adj.at[:args.num_candidates, :args.num_candidates].set(w_pdists)
+                adj = adj.at[args.num_candidates, :args.num_candidates].set(sw_dists)
+                adj = adj.at[:args.num_candidates, args.num_candidates + 1].set(wg_dists)
+                shortest_dists, predecessors, _ = bellman_ford(adj, args.num_candidates)
+                shortest_path, shortest_dists, start_idx = get_shortest_path(
+                    shortest_dists, predecessors, args.num_candidates, args.num_candidates + 1)
+                start_idx = start_idx + 1
+                w_counter = 0
+                planning_state = planning_state.replace(
+                    shortest_path=shortest_path,
+                    shortest_dists=shortest_dists,
+                    start_idx=start_idx,
+                    w_counter=w_counter,
+                    init_waypoint_obs=waypoint_obs,
+                    init_w_repr=w_repr,
+                    init_projected_w_repr=projected_w_repr,
+                    init_sw_dists=sw_dists,
+                    init_wg_dists=wg_dists,
+                )
+
+                return planning_state
+
+            planning_state = jax.lax.cond(
+                env_state.info['steps'] == 0,
+                update_ps,
+                lambda ps: ps,
+                planning_state,
+            )
+
+            w_idx = planning_state.shortest_path[planning_state.start_idx + planning_state.w_counter]
+            waypoint = planning_state.init_waypoint_obs[w_idx][args.goal_start_idx:args.goal_end_idx]
+            sw_dist = planning_state.init_sw_dists[w_idx]
+
+            def next_waypoint(planning_state):
+                w_counter = jax.lax.min(
+                    planning_state.w_counter + 1, args.num_candidates - planning_state.start_idx)
+                w_idx = planning_state.shortest_path[planning_state.start_idx + planning_state.w_counter]
+                waypoint = planning_state.init_waypoint_obs[w_idx][args.goal_start_idx:args.goal_end_idx]
+                sw_dist = planning_state.init_sw_dists[w_idx]
+
+                planning_state = planning_state.replace(w_counter=w_counter)
+
+                return planning_state, w_idx, waypoint, sw_dist
+
+            planning_state, w_idx, waypoint, sw_dist = jax.lax.cond(
+                sw_dist < args.max_edge_dist,
+                next_waypoint,
+                lambda ps: (ps, w_idx, waypoint, sw_dist),
+                planning_state
+            )
+            wg_dist = planning_state.init_sw_dists[w_idx]
+            sg_dist_via_w = sw_dist + wg_dist
+
+        waypoint = jax.lax.select(
+            jnp.logical_or(sg_dist_via_w < sg_dist, sg_dist > args.max_edge_dist),
+            waypoint,
+            goal[args.goal_start_idx:args.goal_end_idx],
+        )
+
+        # planning_state = (shortest_path, shortest_dist, start_idx, w_counter,
+        #                   init_waypoint_obs, init_w_repr, init_projected_w_repr,
+        #                   init_sw_dists, init_wg_dists)
+
+        return waypoint, planning_state
 
     @jax.jit
-    def get_experience(training_state, env_state, buffer_state, key):
+    def get_experience(training_state, env_state, buffer_state, planning_state, key):
         @jax.jit
         def f(carry, unused_t):
-            env_state, current_key = carry
+            # add search policy here
+            env_state, planning_state, waypoint_transitions, current_key = carry
             current_key, next_key = jax.random.split(current_key)
-            env_state, transition = actor_step(training_state, env, env_state, current_key,
-                                               extra_fields=("truncation", "seed"))
-            return (env_state, next_key), transition
+            waypoint, planning_state = jax.vmap(search_waypoint, in_axes=(None, None, 0, 0))(
+                training_state, waypoint_transitions, env_state, planning_state)
+            # waypoints, planning_state = search_waypoint(
+            #     training_state, waypoint_transitions, env_state, planning_state)
+            env_state_with_waypoint = env_state.replace(
+                obs=jnp.concatenate([env_state.obs[:, :args.obs_dim], waypoint], axis=-1))
 
-        (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=args.unroll_length)
+            _, transition = actor_step(training_state, env, env_state_with_waypoint, current_key,
+                                       extra_fields=("truncation", "seed"))
+            return (env_state, planning_state, waypoint_transitions, next_key), transition
+
+        # @jax.jit
+        # def sample_transitions(replay_buffer, buffer_state, key):
+        #     buffer_state, transitions = replay_buffer.sample(buffer_state)
+        #
+        #     # process transitions for training
+        #     key, batch_key, perm_key = jax.random.split(key, 3)
+        #     batch_keys = jax.random.split(batch_key, transitions.observation.shape[0])
+        #     transitions = jax.vmap(TrajectoryUniformSamplingQueue.flatten_crl_fn, in_axes=(None, 0, 0))(
+        #         (args.gamma, args.obs_dim, args.goal_start_idx, args.goal_end_idx), transitions, batch_keys
+        #     )
+        #
+        #     transitions = jax.tree_util.tree_map(
+        #         lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"),
+        #         transitions,
+        #     )
+        #     permutation = jax.random.permutation(perm_key, len(transitions.observation))
+        #     transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
+        #     transitions = jax.tree_util.tree_map(
+        #         lambda x: x[:args.num_candidates],
+        #         transitions
+        #     )
+        #
+        #     return buffer_state, transitions
+
+        key, batch_key, perm_key = jax.random.split(key, 3)
+        # buffer_state, waypoint_transitions = sample_transitions(
+        #     replay_buffer, buffer_state, sampling_key)
+
+        # sample actor-step worth of transitions
+        buffer_state, waypoint_transitions = replay_buffer.sample(buffer_state)
+
+        # process transitions for training
+        batch_keys = jax.random.split(batch_key, waypoint_transitions.observation.shape[0])
+        waypoint_transitions = jax.vmap(TrajectoryUniformSamplingQueue.flatten_crl_fn, in_axes=(None, 0, 0))(
+            (args.gamma, args.obs_dim, args.goal_start_idx, args.goal_end_idx),
+            waypoint_transitions, batch_keys
+        )
+
+        waypoint_transitions = jax.tree_util.tree_map(
+            lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"),
+            waypoint_transitions,
+        )
+        permutation = jax.random.permutation(perm_key, len(waypoint_transitions.observation))
+        waypoint_transitions = jax.tree_util.tree_map(lambda x: x[permutation], waypoint_transitions)
+        waypoint_transitions = jax.tree_util.tree_map(
+            lambda x: x[:args.num_candidates],
+            waypoint_transitions
+        )
+
+        (env_state, planning_state, _, _), data = jax.lax.scan(
+            f, (env_state, planning_state, waypoint_transitions, key), (),
+            length=args.unroll_length)
 
         buffer_state = replay_buffer.insert(buffer_state, data)
-        return env_state, buffer_state
+        return env_state, buffer_state, planning_state
 
-
-    def prefill_replay_buffer(training_state, env_state, buffer_state, key):
+    def prefill_replay_buffer(training_state, env_state, buffer_state, planning_state, key):
         @jax.jit
         def f(carry, unused):
             del unused
-            training_state, env_state, buffer_state, key = carry
+            training_state, env_state, buffer_state, planning_state, key = carry
             key, new_key = jax.random.split(key)
-            env_state, buffer_state = get_experience(
+            env_state, buffer_state, planning_state = get_experience(
                 training_state,
                 env_state,
                 buffer_state,
+                planning_state,
                 key,
             )
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + args.env_steps_per_actor_step,
             )
-            return (training_state, env_state, buffer_state, new_key), ()
+            return (training_state, env_state, buffer_state, planning_state, new_key), ()
 
-        return jax.lax.scan(f, (training_state, env_state, buffer_state, key), (), length=args.num_prefill_actor_steps)[
-            0]
-
+        return jax.lax.scan(f, (training_state, env_state, buffer_state, planning_state, key), (),
+                            length=args.num_prefill_actor_steps)[0]
 
     @jax.jit
     def update_actor_and_alpha(transitions, training_state, key):
@@ -644,7 +837,8 @@ if __name__ == "__main__":
             g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
             g_repr = projection.apply(proj_params, g_repr)
 
-            qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+            # qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+            qf_pi = jnp.diag(energy_fn(sa_repr, g_repr))
             # qf_pi = -jnp.mean((sa_repr - g_repr) ** 2, axis=-1)
 
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
@@ -675,7 +869,6 @@ if __name__ == "__main__":
 
         return training_state, metrics
 
-
     @jax.jit
     def update_critic(transitions, training_state, key):
         def critic_loss(critic_params, transitions, key):
@@ -703,7 +896,8 @@ if __name__ == "__main__":
             # rand_g_repr = projection.apply(proj_params, jax.lax.stop_gradient(rand_g_repr))
 
             # InfoNCE
-            logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = B x B
+            # logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = B x B
+            logits = energy_fn(sa_repr, g_repr)
             # logits = -jnp.mean((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1)  # shape = B x B
             # logits_no_resubs = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - rand_g_repr[None, :, :]) ** 2, axis=-1))
             # logits_no_resubs = jnp.fill_diagonal(logits, -jnp.inf, inplace=False)
@@ -745,7 +939,6 @@ if __name__ == "__main__":
 
         return training_state, metrics
 
-
     @jax.jit
     def sgd_step(carry, transitions):
         training_state, key = carry
@@ -763,16 +956,16 @@ if __name__ == "__main__":
 
         return (training_state, key,), metrics
 
-
     @jax.jit
-    def training_step(training_state, env_state, buffer_state, key):
+    def training_step(training_state, env_state, buffer_state, planning_state, key):
         experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
 
         # update buffer
-        env_state, buffer_state = get_experience(
+        env_state, buffer_state, planning_state = get_experience(
             training_state,
             env_state,
             buffer_state,
+            planning_state,
             experience_key1,
         )
 
@@ -803,34 +996,33 @@ if __name__ == "__main__":
         # take actor-step worth of training-step
         (training_state, _,), metrics = jax.lax.scan(sgd_step, (training_state, training_key), transitions)
 
-        return (training_state, env_state, buffer_state,), metrics
-
+        return (training_state, env_state, buffer_state, planning_state), metrics
 
     @jax.jit
     def training_epoch(
-            training_state,
-            env_state,
-            buffer_state,
-            key,
+        training_state,
+        env_state,
+        buffer_state,
+        planning_state,
+        key,
     ):
         @jax.jit
         def f(carry, unused_t):
-            ts, es, bs, k = carry
+            ts, es, bs, ps, k = carry
             k, train_key = jax.random.split(k, 2)
-            (ts, es, bs,), metrics = training_step(ts, es, bs, train_key)
-            return (ts, es, bs, k), metrics
+            (ts, es, bs, ps), metrics = training_step(ts, es, bs, ps, train_key)
+            return (ts, es, bs, ps, k), metrics
 
-        (training_state, env_state, buffer_state, key), metrics = jax.lax.scan(f, (
-        training_state, env_state, buffer_state, key), (), length=args.num_training_steps_per_epoch)
+        (training_state, env_state, buffer_state, planning_state, key), metrics = jax.lax.scan(f, (
+            training_state, env_state, buffer_state, planning_state, key), (), length=args.num_training_steps_per_epoch)
 
         metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
-        return training_state, env_state, buffer_state, metrics
-
+        return training_state, env_state, buffer_state, planning_state, metrics
 
     key, prefill_key = jax.random.split(key, 2)
 
-    training_state, env_state, buffer_state, _ = prefill_replay_buffer(
-        training_state, env_state, buffer_state, prefill_key
+    training_state, env_state, buffer_state, planning_state, _ = prefill_replay_buffer(
+        training_state, env_state, buffer_state, planning_state, prefill_key
     )
 
     '''Setting up evaluator'''
@@ -849,8 +1041,8 @@ if __name__ == "__main__":
         t = time.time()
 
         key, epoch_key = jax.random.split(key)
-        training_state, env_state, buffer_state, metrics = training_epoch(training_state, env_state, buffer_state,
-                                                                          epoch_key)
+        training_state, env_state, buffer_state, planning_state, metrics = training_epoch(
+            training_state, env_state, buffer_state, planning_state, epoch_key)
 
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
@@ -902,6 +1094,12 @@ if __name__ == "__main__":
 
     render(training_state, env, save_path, args.exp_name,
            wandb_track=args.track)
+
+
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    with jax.disable_jit(args.debug):
+        main(args)
 
 # (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)
 # 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step 

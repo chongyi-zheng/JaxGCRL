@@ -76,6 +76,8 @@ class Args:
     open_loop: bool = False
     """number of candidate waypoints"""
     num_candidates: int = 1000
+    """whether to use planner during evaluation"""
+    eval_planner: bool = False
 
     # to be filled in runtime
     env_steps_per_actor_step: int = 0
@@ -604,7 +606,7 @@ def main(args):
             extras={"state_extras": state_extras},
         )
 
-    def search_waypoint(trianing_state, env_state, planning_state):
+    def search_waypoint(training_state, env_state, planning_state):
         # (shortest_path, shortest_dist, start_idx, w_counter,
         #  init_waypoint_obs, init_w_repr, init_projected_w_repr,
         #  init_sw_dists, init_wg_dists) = planning_state
@@ -616,9 +618,9 @@ def main(args):
         goal = jnp.zeros_like(state)
         goal = goal.at[args.goal_start_idx:args.goal_end_idx].set(g)
         dummy_action = jnp.zeros((action_size, ))
-        # s_repr = sa_encoder.apply(trianing_state.historical_critic_state.params["sa_encoder"],
+        # s_repr = sa_encoder.apply(training_state.historical_critic_state.params["sa_encoder"],
         #                           state, dummy_action)
-        # g_repr = sa_encoder.apply(trianing_state.historical_critic_state.params["sa_encoder"],
+        # g_repr = sa_encoder.apply(training_state.historical_critic_state.params["sa_encoder"],
         #                           goal, dummy_action)
         # projected_g_repr = projection.apply(
         #     trianing_state.historical_critic_state.params["projection"], g_repr)
@@ -717,6 +719,13 @@ def main(args):
 
         return waypoint, planning_state
 
+    def planner_step(env_state, planning_state):
+        waypoint, planning_state = jax.vmap(search_waypoint, in_axes=(None, 0, None))(
+            training_state, env_state, planning_state)
+        env_state_with_waypoint = env_state.replace(
+            obs=jnp.concatenate([env_state.obs[:, :args.obs_dim], waypoint], axis=-1))
+        return env_state_with_waypoint
+
     @jax.jit
     def get_experience(training_state, env_state, buffer_state, planning_state, key, prefill=False):
         @jax.jit
@@ -725,20 +734,22 @@ def main(args):
             env_state, planning_state, current_key = carry
             current_key, next_key = jax.random.split(current_key)
 
-            def planning_f(env_state, planning_state):
-                waypoint, planning_state = jax.vmap(search_waypoint, in_axes=(None, 0, None))(
-                    training_state, env_state, planning_state)
-                # waypoints, planning_state = search_waypoint(
-                #     training_state, waypoint_transitions, env_state, planning_state)
-                env_state_with_waypoint = env_state.replace(
-                    obs=jnp.concatenate([env_state.obs[:, :args.obs_dim], waypoint], axis=-1))
-                return env_state_with_waypoint
+            # def planning_f(env_state, planning_state):
+            #     waypoint, planning_state = jax.vmap(search_waypoint, in_axes=(None, 0, None))(
+            #         training_state, env_state, planning_state)
+            #     # waypoints, planning_state = search_waypoint(
+            #     #     training_state, waypoint_transitions, env_state, planning_state)
+            #     env_state_with_waypoint = env_state.replace(
+            #         obs=jnp.concatenate([env_state.obs[:, :args.obs_dim], waypoint], axis=-1))
+            #     return env_state_with_waypoint
 
             env_state = jax.lax.cond(
                 prefill,
-                planning_f,
+                # planning_f,
                 # lambda es, ps: es,
-                planning_f,
+                # planning_f,
+                planner_step,
+                planner_step,
                 env_state, planning_state
             )
             # if prefill:
@@ -1042,12 +1053,12 @@ def main(args):
 
         return (training_state, key,), metrics
 
-    @jax.jit
-    def planning_step(transitions, training_state, planning_state):
-        training_state, planning_state = update_planning_state(
-            transitions, training_state, planning_state)
-
-        return training_state, planning_state
+    # @jax.jit
+    # def planning_step(transitions, training_state, planning_state):
+    #     training_state, planning_state = update_planning_state(
+    #         transitions, training_state, planning_state)
+    #
+    #     return training_state, planning_state
 
 
     @jax.jit
@@ -1095,7 +1106,9 @@ def main(args):
         (training_state, _,), metrics = jax.lax.scan(sgd_step, (training_state, training_key), transitions)
 
         # update planning state
-        training_state, planning_state = planning_step(waypoint_transitions, training_state, planning_state)
+        # training_state, planning_state = planning_step(waypoint_transitions, training_state, planning_state)
+        training_state, planning_state = update_planning_state(
+            waypoint_transitions, training_state, planning_state)
 
         return (training_state, env_state, buffer_state, planning_state), metrics
 
@@ -1129,6 +1142,7 @@ def main(args):
     '''Setting up evaluator'''
     evaluator = CrlEvaluator(
         deterministic_actor_step,
+        planner_step if args.eval_planner else lambda s, ps: s,
         env,
         num_eval_envs=args.num_eval_envs,
         episode_length=args.episode_length,
@@ -1159,7 +1173,7 @@ def main(args):
             **{f"training/{name}": value for name, value in metrics.items()},
         }
 
-        metrics = evaluator.run_evaluation(training_state, metrics)
+        metrics = evaluator.run_evaluation(training_state, planning_state, metrics)
 
         print(metrics)
 

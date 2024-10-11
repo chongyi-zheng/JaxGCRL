@@ -78,6 +78,8 @@ class Args:
     open_loop: bool = False
     """number of candidate waypoints"""
     num_candidates: int = 1000
+    """whether to use planner during training"""
+    train_planner: bool = False
     """whether to use planner during evaluation"""
     eval_planner: bool = False
 
@@ -729,7 +731,7 @@ def main(args):
         return env_state_with_waypoint
 
     @jax.jit
-    def get_experience(training_state, env_state, buffer_state, planning_state, key, prefill=False):
+    def get_experience(training_state, env_state, buffer_state, planning_state, key, use_planner=False):
         @jax.jit
         def f(carry, unused_t):
             # add search policy here
@@ -746,12 +748,12 @@ def main(args):
             #     return env_state_with_waypoint
 
             env_state = jax.lax.cond(
-                prefill,
+                use_planner,
                 # planning_f,
-                lambda es, ps: es,
                 # planning_f,
                 # planner_step,
                 planner_step,
+                lambda es, ps: es,
                 env_state, planning_state
             )
             # if prefill:
@@ -864,7 +866,7 @@ def main(args):
                 buffer_state,
                 planning_state,
                 key,
-                prefill=True,
+                use_planner=False,
             )
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + args.env_steps_per_actor_step,
@@ -1074,6 +1076,7 @@ def main(args):
             buffer_state,
             planning_state,
             experience_key1,
+            use_planner=args.train_planner,
         )
 
         training_state = training_state.replace(

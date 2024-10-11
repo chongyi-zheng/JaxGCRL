@@ -25,6 +25,7 @@ from wandb_osh.hooks import TriggerWandbSyncHook
 from buffer import TrajectoryUniformSamplingQueue
 from evaluator import CrlEvaluator
 from planning import bellman_ford, get_shortest_path
+from utils import plot_trajectories
 
 
 @dataclass
@@ -58,6 +59,7 @@ class Args:
     num_epochs: int = 50
     num_envs: int = 1024
     num_eval_envs: int = 128
+    num_eval_vis: int = 8
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -417,7 +419,7 @@ def main(args):
 
     # Environment setup
     if args.env_id == "ant":
-        from envs.ant import Ant
+        from clean_JaxGCRL.envs.ant import Ant
 
         env = Ant(
             backend="spring",
@@ -430,7 +432,7 @@ def main(args):
         args.goal_end_idx = 2
 
     elif "maze" in args.env_id:
-        from envs.ant_maze import AntMaze
+        from clean_JaxGCRL.envs.ant_maze import AntMaze
 
         env = AntMaze(
             backend="spring",
@@ -618,12 +620,12 @@ def main(args):
         goal = jnp.zeros_like(state)
         goal = goal.at[args.goal_start_idx:args.goal_end_idx].set(g)
         dummy_action = jnp.zeros((action_size, ))
-        # s_repr = sa_encoder.apply(training_state.historical_critic_state.params["sa_encoder"],
+        # s_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
         #                           state, dummy_action)
-        # g_repr = sa_encoder.apply(training_state.historical_critic_state.params["sa_encoder"],
+        # g_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
         #                           goal, dummy_action)
         # projected_g_repr = projection.apply(
-        #     trianing_state.historical_critic_state.params["projection"], g_repr)
+        #     training_state.historical_critic_params["projection"], g_repr)
         # w_repr = sa_encoder.apply(training_state.critic_state.params["sa_encoder"],
         #                           waypoint_obs, waypoint_action)
         # projected_w_repr = projection.apply(training_state.critic_state.params["projection"], w_repr)
@@ -631,11 +633,11 @@ def main(args):
         # compute representation distances
         # w_pdists = -energy_fn(w_repr, projected_w_repr)
         # w_pdists = jnp.where((w_pdists < args.max_edge_dist), w_pdists, jnp.inf)
-        # sw_dists = -energy_fn(s_repr[None], planning_state.projected_w_repr).squeeze()
+        # sw_dists = -energy_fn(s_repr[None, :], planning_state.projected_w_repr).squeeze()
         # sw_dists = jnp.where(sw_dists < args.max_edge_dist, sw_dists, jnp.inf)
-        # wg_dists = -energy_fn(planning_state.w_repr, projected_g_repr[None]).squeeze()
+        # wg_dists = -energy_fn(planning_state.w_repr, projected_g_repr[None, :]).squeeze()
         # wg_dists = jnp.where(wg_dists < args.max_edge_dist, wg_dists, jnp.inf)
-        # sg_dist = -energy_fn(s_repr[None], projected_g_repr[None]).squeeze()
+        # sg_dist = -energy_fn(s_repr[None, :], projected_g_repr[None, :]).squeeze()
 
         sw_dists = jnp.linalg.norm(state[:2][None] - planning_state.waypoint_obs[:, :2], axis=-1)
         sw_dists = jnp.where(sw_dists < args.max_edge_dist, sw_dists, jnp.inf)
@@ -746,9 +748,9 @@ def main(args):
             env_state = jax.lax.cond(
                 prefill,
                 # planning_f,
-                # lambda es, ps: es,
+                lambda es, ps: es,
                 # planning_f,
-                planner_step,
+                # planner_step,
                 planner_step,
                 env_state, planning_state
             )
@@ -1008,8 +1010,8 @@ def main(args):
 
     @jax.jit
     def update_planning_state(transitions, training_state, planning_state):
-        # training_state = training_state.replace(
-        #     historical_critic_params=training_state.critic_state.params)
+        training_state = training_state.replace(
+            historical_critic_params=training_state.critic_state.params)
 
         # compute representations
         waypoint_obs = transitions.observation[:, :args.obs_dim]
@@ -1019,7 +1021,7 @@ def main(args):
         projected_w_repr = projection.apply(training_state.historical_critic_params["projection"],
                                             w_repr)
 
-        # w_pdists = -energy_fn(w_repr, projected_w_repr)
+        # w_pdists = -energy_fn(w_repr[:, None], projected_w_repr[None, :])
         # w_pdists = jnp.where((w_pdists < args.max_edge_dist), w_pdists, jnp.inf)
 
         w_pdists = jnp.linalg.norm(waypoint_obs[:, :2][None] - waypoint_obs[:, :2][:, None], axis=-1)
@@ -1173,7 +1175,13 @@ def main(args):
             **{f"training/{name}": value for name, value in metrics.items()},
         }
 
-        metrics = evaluator.run_evaluation(training_state, planning_state, metrics)
+        metrics, stats = evaluator.run_evaluation(training_state, planning_state, metrics)
+        if args.track:
+            # plot trajectories
+            import matplotlib.pyplot as plt
+            fig = plot_trajectories(args.num_eval_vis, stats, use_planner=args.eval_planner)
+            wandb.log({"evaluation_trajectory": wandb.Image(fig)}, step=ne)
+            plt.close(fig)
 
         print(metrics)
 

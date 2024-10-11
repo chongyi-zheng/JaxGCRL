@@ -1,4 +1,4 @@
-name: contrastive_rl
+name: jax-gcrl
 channels:
   - conda-forge
 dependencies:
@@ -23,6 +23,5 @@ dependencies:
     - nvidia-cudnn-cu12==8.9.7.29
     - mujoco-mjx==3.1.2
     - stack-data==0.6.3
-    - plotly==5.24.1x
     - jaxlib==0.4.25+cuda12.cudnn89
     - -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html

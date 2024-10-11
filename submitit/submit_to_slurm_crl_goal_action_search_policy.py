@@ -13,7 +13,7 @@ def main():
         partition = 'gpu'
     elif cluster_name == 'della':
         log_root_dir = '/home/cz8792/gpfs'
-        partition = 'gpu-short'
+        partition = 'gpu-test'
     elif cluster_name in ['soak.cs.princeton.edu', 'wash.cs.princeton.edu',
                           'rinse.cs.princeton.edu', 'spin.cs.princeton.edu']:
         log_root_dir = '/n/fs/rl-chongyiz'
@@ -23,13 +23,13 @@ def main():
 
     executor = submitit.AutoExecutor(folder="/tmp/submitit_logs")  # this path is not actually used.
     executor.update_parameters(
-        slurm_name="crl",
-        slurm_time=3 * 60,  # minute
+        slurm_name="jax_gcrl_crl",
+        slurm_time=1 * 60,  # minute
         slurm_partition=partition,
         slurm_nodes=1,
         slurm_ntasks_per_node=1,  # tasks can share nodes
         slurm_cpus_per_task=8,
-        slurm_mem="24G",
+        slurm_mem="16G",
         # slurm_mem_per_cpu="1G",
         slurm_gpus_per_node=1,
         slurm_stderr_to_stdout=True,
@@ -52,8 +52,11 @@ def main():
                                 submitit_log_dir).expanduser().absolute()
 
                             cmds = f"""
-                                source "$HOME"/.bashrc;
+                                unset PYTHONPATH;
+                                source $HOME/.zshrc;
                                 conda activate jax-gcrl;
+                                which python;
+                                echo $CONDA_PREFIX;
         
                                 echo job_id: $SLURM_ARRAY_JOB_ID;
                                 echo task_id: $SLURM_ARRAY_TASK_ID;
@@ -61,11 +64,8 @@ def main():
                                 echo seed: {seed};
         
                                 export PROJECT_DIR=$PWD;
-                                export LD_LIBRARY_PATH="$CONDA_PREFIX"/lib;
-                                export LD_LIBRARY_PATH="$LD_LIBRARY_PATH":/usr/lib/nvidia;
                                 export PYTHONPATH=$HOME/research/JaxGCRL;
-                                export CUDA_VISIBLE_DEVICES=0;
-                                export GPUS=0;
+                                export PATH="$PATH":"$CONDA_PREFIX"/bin;
                                 export WANDB_API_KEY=bbb3bca410f71c2d7cfe6fe0bbe55a38d1015831;
         
                                 rm -rf {log_dir};
@@ -74,6 +74,7 @@ def main():
                                     --track \
                                     --{train_planner} \
                                     --{eval_planner} \
+                                    --seed={seed} \
                                     --env_id={env_id} \
                                     --batch_size=1024 \
                                     --repr_dim=64 \
@@ -90,7 +91,7 @@ def main():
                             """
 
                             cmd_func = submitit.helpers.CommandFunction([
-                                "/bin/bash", "-c",
+                                "/bin/zsh", "-c",
                                 cmds,
                             ], verbose=True)
 

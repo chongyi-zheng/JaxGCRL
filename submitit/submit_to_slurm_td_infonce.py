@@ -23,7 +23,7 @@ def main():
 
     executor = submitit.AutoExecutor(folder="/tmp/submitit_logs")  # this path is not actually used.
     executor.update_parameters(
-        slurm_name="crl",
+        slurm_name="td_infonce",
         slurm_time=3 * 60,  # minute
         slurm_partition=partition,
         slurm_nodes=1,
@@ -41,7 +41,7 @@ def main():
                 for seed in [0]:
                     exp_name = f"ant_u_maze_forward_infonce_logsumexp_reg"
                     log_dir = os.path.expanduser(
-                        f"{log_root_dir}/exp_logs/jax_gcrl_logs/crl/{exp_name}/{seed}")
+                        f"{log_root_dir}/exp_logs/jax_gcrl_logs/td_infonce/{exp_name}/{seed}")
 
                     # change the log folder of slurm executor
                     submitit_log_dir = os.path.join(os.path.dirname(log_dir),
@@ -68,7 +68,7 @@ def main():
 
                         rm -rf {log_dir};
                         mkdir -p {log_dir};
-                        python $PROJECT_DIR/clean_JaxGCRL/train_crl_jax_brax.py \
+                        python $PROJECT_DIR/clean_JaxGCRL/train_td_infonce_jax_brax.py \
                             --track \
                             --seed={seed} \
                             --env_id={env_id} \

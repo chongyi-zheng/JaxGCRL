@@ -25,6 +25,13 @@ U_MAZE = [[1, 1, 1, 1, 1],
           [1, G, G, G, 1],
           [1, 1, 1, 1, 1]]
 
+RANDOMIZED_RESET_U_MAZE = [[1, 1, 1, 1, 1],
+                           [1, R, R, R, 1],
+                           [1, 1, 1, R, 1],
+                           [1, G, R, R, 1],
+                           [1, 1, 1, 1, 1]]
+
+
 RANDOMIZED_U_MAZE = [[1, 1, 1, 1, 1],
                      [1, C, C, C, 1],
                      [1, 1, 1, C, 1],
@@ -91,6 +98,8 @@ def find_goals(structure, size_scaling):
 def make_maze(maze_layout_name, maze_size_scaling, ):
     if maze_layout_name == "u_maze":
         maze_layout = U_MAZE
+    elif maze_layout_name == "randomized_init_u_maze":
+        maze_layout = RANDOMIZED_RESET_U_MAZE
     elif maze_layout_name == "randomized_u_maze":
         maze_layout = RANDOMIZED_U_MAZE
     elif maze_layout_name == "u_maze_eval":

@@ -202,12 +202,15 @@ class TrajectoryUniformSamplingQueue():
         # 2) have the same seed as the ith time index
 
         goal_index = jax.random.categorical(sample_key, jnp.log(probs))
-        future_state = jnp.take(transition.observation, goal_index[:-1], axis=0) #the last goal_index cannot be considered as there is no future.  
+        future_obs = jnp.take(transition.observation, goal_index[:-1], axis=0) #the last goal_index cannot be considered as there is no future.
         future_action = jnp.take(transition.action, goal_index[:-1], axis=0)
-        goal = future_state[:, goal_start_idx:goal_end_idx]
-        future_state = future_state[:, :obs_dim]
+        future_state = future_obs[:, :obs_dim]
+        commanded_state = jnp.zeros_like(future_state)
+        commanded_state = commanded_state.at[:, goal_start_idx:goal_end_idx].set(
+            transition.observation[:-1, obs_dim:])
         state = transition.observation[:-1, :obs_dim] #all states are considered
         next_state = transition.observation[1:, :obs_dim]
+        goal = future_state[:, goal_start_idx:goal_end_idx]
         new_obs = jnp.concatenate([state, goal], axis=1)
 
         extras = {
@@ -218,6 +221,7 @@ class TrajectoryUniformSamplingQueue():
             },
             "state": state,
             "next_state": next_state,
+            "commanded_state": commanded_state,
             "future_state": future_state,
             "future_action": future_action,
         }

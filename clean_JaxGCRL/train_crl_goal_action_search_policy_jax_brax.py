@@ -23,7 +23,7 @@ from flax.core import FrozenDict
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 from buffer import TrajectoryUniformSamplingQueue
-from evaluator import CrlEvaluator
+from evaluator import CrlPlanningEvaluator
 from planning import bellman_ford, get_shortest_path
 from utils import plot_trajectories
 
@@ -1145,7 +1145,7 @@ def main(args):
     )
 
     '''Setting up evaluator'''
-    evaluator = CrlEvaluator(
+    evaluator = CrlPlanningEvaluator(
         deterministic_actor_step,
         planner_step if args.eval_planner else lambda s, ps: s,
         env,

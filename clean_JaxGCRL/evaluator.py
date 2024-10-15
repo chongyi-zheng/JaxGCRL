@@ -27,7 +27,7 @@ class CrlEvaluator():
         self._key = key
         self._eval_walltime = 0.
 
-        eval_env = envs.training.EvalWrapper(eval_env)
+        eval_env = EvalWrapper(eval_env)
 
         def generate_eval_unroll(training_state, key):
             reset_keys = jax.random.split(key, num_eval_envs)
@@ -52,6 +52,7 @@ class CrlEvaluator():
         eval_metrics.active_episodes.block_until_ready()
         epoch_eval_time = time.time() - t
         metrics = {}
+        stats = {}
         aggregating_fns = [
             (np.mean, ""),
             # (np.std, "_std"),
@@ -63,17 +64,27 @@ class CrlEvaluator():
             metrics.update(
                 {
                     f"eval/episode_{name}{suffix}": (
-                        fn(eval_metrics.episode_metrics[name]) if aggregate_episodes else eval_metrics.episode_metrics[
-                            name]
+                        fn(eval_metrics.episode_sum_metrics[name])
+                        if aggregate_episodes else eval_metrics.episode_sum_metrics[name]
                     )
                     for name in ['reward', 'success', 'success_easy', 'dist', 'distance_from_origin']
                 }
             )
 
+        stats.update(
+            {
+                f"eval/episode_{name}": (
+                    eval_metrics.episode_metrics[name]
+                )
+                for name in ['position', 'waypoint_position', 'target_position']
+            }
+        )
+        stats["eval/episode_steps"] = eval_metrics.episode_steps
+
         # We check in how many env there was at least one step where there was success
-        if "success" in eval_metrics.episode_metrics:
+        if "success" in eval_metrics.episode_sum_metrics:
             metrics["eval/episode_success_any"] = np.mean(
-                eval_metrics.episode_metrics["success"] > 0.0
+                eval_metrics.episode_sum_metrics["success"] > 0.0
             )
 
         metrics["eval/avg_episode_length"] = np.mean(eval_metrics.episode_steps)
@@ -82,24 +93,25 @@ class CrlEvaluator():
         self._eval_walltime = self._eval_walltime + epoch_eval_time
         metrics = {"eval/walltime": self._eval_walltime, **training_metrics, **metrics}
 
-        return metrics
+        return metrics, stats
 
 
 def generate_planning_unroll(actor_step, planner_step,
                              training_state, planning_state,
                              env, env_state,
-                             unroll_length, extra_fields=()):
+                             unroll_length, key, extra_fields=()):
     """Collect trajectories of given unroll_length."""
 
     @jax.jit
     def f(carry, unused_t):
-        state, planning_state = carry
-        state = planner_step(state, planning_state)
+        state, planning_state, current_key = carry
+        next_key, planning_key = jax.random.split(current_key)
+        state = planner_step(state, planning_state, planning_key)
         nstate, transition = actor_step(training_state, env, state, extra_fields=extra_fields)
-        return (nstate, planning_state), transition
+        return (nstate, planning_state, next_key), transition
 
-    (final_state, planning_state), data = jax.lax.scan(
-        f, (env_state, planning_state), (), length=unroll_length)
+    (final_state, planning_state, _), data = jax.lax.scan(
+        f, (env_state, planning_state, key), (), length=unroll_length)
     return final_state, planning_state, data
 
 
@@ -113,6 +125,7 @@ class CrlPlanningEvaluator:
         eval_env = EvalWrapper(eval_env)
 
         def generate_eval_unroll(training_state, planning_state, key):
+            key, planning_key = jax.random.split(key, 2)
             reset_keys = jax.random.split(key, num_eval_envs)
             eval_first_state = eval_env.reset(reset_keys)
             return generate_planning_unroll(
@@ -122,7 +135,8 @@ class CrlPlanningEvaluator:
                 planning_state,
                 eval_env,
                 eval_first_state,
-                unroll_length=episode_length)
+                episode_length,
+                planning_key)
 
         self._generate_eval_unroll = jax.jit(generate_eval_unroll)
         self._steps_per_unroll = episode_length * num_eval_envs

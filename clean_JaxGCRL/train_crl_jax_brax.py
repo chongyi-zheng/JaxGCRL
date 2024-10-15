@@ -23,6 +23,7 @@ from wandb_osh.hooks import TriggerWandbSyncHook
 
 from buffer import TrajectoryUniformSamplingQueue
 from evaluator import CrlEvaluator
+from utils import plot_trajectories
 
 
 @dataclass
@@ -55,6 +56,7 @@ class Args:
     num_epochs: int = 50
     num_envs: int = 1024
     num_eval_envs: int = 128
+    num_eval_vis: int = 8
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -298,7 +300,7 @@ if __name__ == "__main__":
 
     # Environment setup    
     if args.env_id == "ant":
-        from envs.ant import Ant
+        from clean_JaxGCRL.envs.ant import Ant
 
         env = Ant(
             backend="spring",
@@ -311,7 +313,7 @@ if __name__ == "__main__":
         args.goal_end_idx = 2
 
     elif "maze" in args.env_id:
-        from envs.ant_maze import AntMaze
+        from clean_JaxGCRL.envs.ant_maze import AntMaze
 
         env = AntMaze(
             backend="spring",
@@ -697,7 +699,14 @@ if __name__ == "__main__":
             **{f"training/{name}": value for name, value in metrics.items()},
         }
 
-        metrics = evaluator.run_evaluation(training_state, metrics)
+        metrics, stats = evaluator.run_evaluation(training_state, metrics)
+        if args.track:
+            # plot trajectories
+            import matplotlib.pyplot as plt
+
+            fig = plot_trajectories(args.num_eval_vis, stats, use_planner=False)
+            wandb.log({"evaluation_trajectory": wandb.Image(fig)}, step=ne)
+            plt.close(fig)
 
         print(metrics)
 

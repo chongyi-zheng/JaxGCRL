@@ -1111,7 +1111,6 @@ def main(args):
         (training_state, _,), metrics = jax.lax.scan(sgd_step, (training_state, training_key), transitions)
 
         # update planning state
-        # training_state, planning_state = planning_step(waypoint_transitions, training_state, planning_state)
         training_state, planning_state = update_planning_state(
             waypoint_transitions, training_state, planning_state)
 

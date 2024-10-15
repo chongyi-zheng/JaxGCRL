@@ -23,6 +23,7 @@ from wandb_osh.hooks import TriggerWandbSyncHook
 
 from buffer import TrajectoryUniformSamplingQueue
 from evaluator import CrlEvaluator
+from utils import plot_trajectories
 
 
 @dataclass
@@ -55,6 +56,7 @@ class Args:
     num_epochs: int = 50
     num_envs: int = 1024
     num_eval_envs: int = 128
+    num_eval_vis: int = 8
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -119,6 +121,8 @@ class SA_encoder(nn.Module):
         x = normalize(x)
         x = nn.swish(x)
         x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.tanh(x)
+
         return x
 
 
@@ -161,6 +165,7 @@ class G_encoder(nn.Module):
         x = normalize(x)
         x = nn.swish(x)
         x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.tanh(x)
 
         return x
 
@@ -217,36 +222,12 @@ class Actor(nn.Module):
 
         return mean, log_std
 
-class RotationMatrix(nn.Module):
-    repr_dim: int = 64
-    ortho_rot: bool = False
-
-    # def setup(self):
-    #     self.rotation = self.param('rotation', lambda key, shape: jnp.eye(shape[0], dtype=jnp.float32),
-    #                                 (self.repr_dim, self.repr_dim))
-    @nn.compact
-    def __call__(self, s_repr):
-        # if self.ortho_rot:
-        #     I = jnp.eye(self.repr_dim)
-        #     rotation = self.rotation - self.rotation.T
-        #     rotation = (I + rotation) @ jnp.linalg.inv(I - rotation)
-        # else:
-        #     rotation = self.rotation
-
-        # s_repr = jnp.einsum('jk,ik->ij', rotation, s_repr)
-
-        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
-        s_repr = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, use_bias=False)(s_repr)
-
-        return s_repr
-
-
 class Projection(nn.Module):
     repr_dim: int = 64
     norm_type: str = "layer_norm"
     @nn.compact
-    # def __call__(self, sa_repr):
-    def __call__(self, s_repr, action, g_repr):
+    def __call__(self, sa_repr):
+    # def __call__(self, s_repr, action):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
@@ -265,8 +246,8 @@ class Projection(nn.Module):
 
             return x
 
-        x = jnp.concatenate([s_repr, action, g_repr], axis=-1)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        # x = jnp.concatenate([s_repr, action], axis=-1)
+        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(sa_repr)
         x = normalize(x)
         x = nn.swish(x)
         # x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
@@ -280,6 +261,7 @@ class Projection(nn.Module):
         x = normalize(x)
         x = nn.swish(x)
         x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.tanh(x)
 
         return x
 
@@ -405,9 +387,9 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
     key, buffer_key, env_key, eval_env_key, actor_key, sa_key, g_key, rot_key = jax.random.split(key, 8)
 
-    # Environment setup    
+    # Environment setup
     if args.env_id == "ant":
-        from envs.ant import Ant
+        from clean_JaxGCRL.envs.ant import Ant
 
         env = Ant(
             backend="spring",
@@ -420,7 +402,7 @@ if __name__ == "__main__":
         args.goal_end_idx = 2
 
     elif "maze" in args.env_id:
-        from envs.ant_maze import AntMaze
+        from clean_JaxGCRL.envs.ant_maze import AntMaze
 
         env = AntMaze(
             backend="spring",
@@ -463,8 +445,7 @@ if __name__ == "__main__":
     g_encoder = G_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]))
     projection = Projection(repr_dim=args.repr_dim)
-    proj_params = projection.init(rot_key,
-                                  np.ones([1, args.repr_dim]), np.ones([1, action_size]), np.ones([1, args.repr_dim]))
+    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
     # proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
@@ -637,15 +618,15 @@ if __name__ == "__main__":
 
             sa_encoder_params, g_encoder_params, proj_params = (
                 critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
-            s_repr = g_encoder.apply(g_encoder_params, state)
-            g_repr = g_encoder.apply(g_encoder_params, goal)
-            sag_repr = projection.apply(proj_params, s_repr, action, g_repr)
-            # sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+            # s_repr = g_encoder.apply(g_encoder_params, state)
+            # sa_repr = projection.apply(proj_params, s_repr, action)
+            # g_repr = g_encoder.apply(g_encoder_params, goal)
+            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             # sa_repr = projection.apply(proj_params, sa_repr)
-            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
-            # g_repr = projection.apply(proj_params, g_repr)
+            gga_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            gga_repr = projection.apply(proj_params, gga_repr)
 
-            qf_pi = -jnp.sqrt(jnp.sum((sag_repr - g_repr) ** 2, axis=-1))
+            qf_pi = -jnp.sqrt(jnp.sum((sa_repr - gga_repr) ** 2, axis=-1))
             # qf_pi = -jnp.mean((sa_repr - g_repr) ** 2, axis=-1)
 
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
@@ -685,29 +666,26 @@ if __name__ == "__main__":
 
             obs = transitions.observation[:, :args.obs_dim]
             action = transitions.action
-            commanded_goal = transitions.extras["commanded_state"]
-            future_goal = transitions.extras["future_state"]
-            # future_goal_action = transitions.extras["future_action"]
+            goal = transitions.extras["future_state"]
+            goal_action = transitions.extras["future_action"]
             # rand_goal = jnp.roll(goal, shift=1, axis=0)
             # rand_goal_action = jnp.roll(goal_action, shift=1, axis=0)
 
-            s_repr = g_encoder.apply(g_encoder_params, obs)
-            commanded_g_repr = g_encoder.apply(g_encoder_params, commanded_goal)
-            sag_repr = projection.apply(proj_params, s_repr, action, commanded_g_repr)
-            sf_repr = g_encoder.apply(g_encoder_params, future_goal)
-            sf_repr = jax.lax.stop_gradient(sf_repr)
-            # sf_repr = jax.lax.stop_gradient(sf_repr)
-            # sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
+            # s_repr = g_encoder.apply(g_encoder_params, obs)
+            # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(s_repr), action)
+            # g_repr = g_encoder.apply(g_encoder_params, goal)
+            # g_repr = jax.lax.stop_gradient(g_repr)
+            sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
             # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(sa_repr))
-            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            gga_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
             # g_repr = jax.lax.stop_gradient(g_repr)
             # g_repr = projection.apply(proj_params, g_repr)
-            # g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
+            gga_repr = projection.apply(proj_params, jax.lax.stop_gradient(gga_repr))
             # rand_g_repr = sa_encoder.apply(sa_encoder_params, rand_goal, rand_goal_action)
             # rand_g_repr = projection.apply(proj_params, jax.lax.stop_gradient(rand_g_repr))
 
             # InfoNCE
-            logits = -jnp.sqrt(jnp.sum((sag_repr[:, None, :] - sf_repr[None, :, :]) ** 2, axis=-1))  # shape = B x B
+            logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - gga_repr[None, :, :]) ** 2, axis=-1))  # shape = B x B
             # logits = -jnp.mean((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1)  # shape = B x B
             # logits_no_resubs = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - rand_g_repr[None, :, :]) ** 2, axis=-1))
             # logits_no_resubs = jnp.fill_diagonal(logits, -jnp.inf, inplace=False)
@@ -870,7 +848,14 @@ if __name__ == "__main__":
             **{f"training/{name}": value for name, value in metrics.items()},
         }
 
-        metrics = evaluator.run_evaluation(training_state, metrics)
+        metrics, stats = evaluator.run_evaluation(training_state, metrics)
+        if args.track:
+            # plot trajectories
+            import matplotlib.pyplot as plt
+
+            fig = plot_trajectories(args.num_eval_vis, stats, use_planner=False)
+            wandb.log({"evaluation_trajectory": wandb.Image(fig)}, step=ne)
+            plt.close(fig)
 
         print(metrics)
 
@@ -908,5 +893,5 @@ if __name__ == "__main__":
            wandb_track=args.track)
 
 # (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)
-# 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step 
+# 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step
 # 1024 x 62 / 4000 = 16                                 #ratio of env steps per gradient step

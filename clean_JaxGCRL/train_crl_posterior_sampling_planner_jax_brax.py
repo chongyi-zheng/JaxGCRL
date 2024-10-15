@@ -22,12 +22,13 @@ from flax.training.train_state import TrainState
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 from buffer import TrajectoryUniformSamplingQueue
-from evaluator import CrlEvaluator
+from evaluator import CrlPlanningEvaluator
 from utils import plot_trajectories
 
 
 @dataclass
 class Args:
+    debug: bool = False
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     seed: int = 1
     torch_deterministic: bool = True
@@ -69,6 +70,12 @@ class Args:
     min_replay_size: int = 1000
 
     unroll_length: int = 62
+    """number of candidate waypoints"""
+    num_candidates: int = 1000
+    """whether to use planner during training"""
+    train_planner: bool = False
+    """whether to use planner during evaluation"""
+    eval_planner: bool = False
 
     # to be filled in runtime
     env_steps_per_actor_step: int = 0
@@ -81,12 +88,12 @@ class Args:
     """the number of training steps per epoch(computed in runtime)"""
 
 
-class SAG_encoder(nn.Module):
+class SA_encoder(nn.Module):
     repr_dim: int = 64
     norm_type: str = "layer_norm"
 
     @nn.compact
-    def __call__(self, s: jnp.ndarray, a: jnp.ndarray, g: jnp.ndarray):
+    def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
 
         lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
@@ -96,7 +103,7 @@ class SAG_encoder(nn.Module):
         else:
             normalize = lambda x: x
 
-        x = jnp.concatenate([s, a, g], axis=-1)
+        x = jnp.concatenate([s, a], axis=-1)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
@@ -113,12 +120,12 @@ class SAG_encoder(nn.Module):
         return x
 
 
-class SF_encoder(nn.Module):
+class S_encoder(nn.Module):
     repr_dim: int = 64
     norm_type: str = "layer_norm"
 
     @nn.compact
-    def __call__(self, sf: jnp.ndarray):
+    def __call__(self, g: jnp.ndarray):
 
         lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
@@ -128,7 +135,7 @@ class SF_encoder(nn.Module):
         else:
             normalize = lambda x: x
 
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(sf)
+        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(g)
         x = normalize(x)
         x = nn.swish(x)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
@@ -193,6 +200,10 @@ class TrainingState:
     critic_state: TrainState
     alpha_state: TrainState
 
+@flax.struct.dataclass
+class PlanningState:
+    candidate_obs: jnp.ndarray
+
 
 class Transition(NamedTuple):
     """Container for a transition"""
@@ -215,48 +226,7 @@ def save_params(path: str, params: Any):
         fout.write(pickle.dumps(params))
 
 
-def render(actor_state, env, exp_dir, exp_name, deterministic=True,
-           wandb_track=False):
-    def actor_sample(observations, key, deterministic=deterministic):
-        means, log_stds = actor.apply(actor_state.params, observations)
-        if deterministic:
-            actions = nn.tanh(means)
-        else:
-            stds = jnp.exp(log_stds)
-            actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
-
-        return actions, {}
-
-    jit_env_reset = jax.jit(env.reset)
-    jit_env_step = jax.jit(env.step)
-    jit_inference_fn = jax.jit(actor_sample)
-
-    rollout = []
-    rng = jax.random.PRNGKey(seed=1)
-    rngs = jax.random.split(rng, 1)
-    state = jit_env_reset(rng=rngs)
-    for i in range(5000):
-        rollout.append(
-            jax.tree_util.tree_map(jnp.squeeze, state.pipeline_state))
-        act_rng, rng = jax.random.split(rng)
-        act_rngs = jax.random.split(act_rng, 1)
-        act, _ = jit_inference_fn(state.obs, act_rngs)
-        state = jit_env_step(state, act)
-        if i % 1000 == 0:
-            rngs = jax.random.split(rng, 1)
-            state = jit_env_reset(rng=rngs)
-
-    url = html.render(env.sys.replace(dt=env.dt), rollout, height=480)
-    with open(os.path.join(exp_dir, f"{exp_name}.html"), "w") as file:
-        file.write(url)
-    if wandb_track:
-        wandb.log({"render": wandb.Html(url)})
-
-
-if __name__ == "__main__":
-
-    args = tyro.cli(Args)
-
+def main(args):
     args.env_steps_per_actor_step = args.num_envs * args.unroll_length
     args.num_prefill_env_steps = args.min_replay_size * args.num_envs
     args.num_prefill_actor_steps = np.ceil(args.min_replay_size / args.unroll_length)
@@ -296,7 +266,7 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, buffer_key, env_key, eval_env_key, actor_key, sag_key, sf_key = jax.random.split(key, 7)
+    key, buffer_key, env_key, eval_env_key, actor_key, sa_key, s_key, g_key = jax.random.split(key, 8)
 
     # Environment setup    
     if args.env_id == "ant":
@@ -350,16 +320,18 @@ if __name__ == "__main__":
     )
 
     # Critic
-    sag_encoder = SAG_encoder(repr_dim=args.repr_dim)
-    sag_encoder_params = sag_encoder.init(
-        sag_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]),
-        np.ones([1, args.goal_end_idx - args.goal_start_idx]))
-    sf_encoder = SF_encoder(repr_dim=args.repr_dim)
-    sf_encoder_params = sf_encoder.init(
-        sf_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
+    sa_encoder = SA_encoder(repr_dim=args.repr_dim)
+    sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
+    s_encoder = S_encoder(repr_dim=args.repr_dim)
+    s_encoder_params = s_encoder.init(s_key, np.ones([1, args.obs_dim]))
+    g_encoder = S_encoder(repr_dim=args.repr_dim)
+    g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
+    # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
-        params={"sag_encoder": sag_encoder_params, "sf_encoder": sf_encoder_params},
+        params={"sa_encoder": sa_encoder_params,
+                "s_encoder": s_encoder_params,
+                "g_encoder": g_encoder_params},
         tx=optax.adam(learning_rate=args.critic_lr),
     )
 
@@ -379,6 +351,10 @@ if __name__ == "__main__":
         actor_state=actor_state,
         critic_state=critic_state,
         alpha_state=alpha_state,
+    )
+
+    planning_state = PlanningState(
+        candidate_obs=jnp.zeros((args.num_candidates, args.obs_dim), dtype=jnp.float32),
     )
 
     # Replay Buffer
@@ -433,8 +409,8 @@ if __name__ == "__main__":
         )
 
 
-    def actor_step(actor_state, env, env_state, key, extra_fields):
-        means, log_stds = actor.apply(actor_state.params, env_state.obs)
+    def actor_step(training_state, env, env_state, key, extra_fields):
+        means, log_stds = actor.apply(training_state.actor_state.params, env_state.obs)
         stds = jnp.exp(log_stds)
         actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
 
@@ -450,41 +426,113 @@ if __name__ == "__main__":
         )
 
 
+    def planner_step(env_state, planning_state, key):
+        # posterior sampling
+        goals = env_state.obs[:, args.obs_dim:]
+        states = env_state.obs[:, :args.obs_dim]
+        w_candidates = planning_state.candidate_obs  # (N, obs_dim)
+
+        s_encoder_params, g_encoder_params = (
+            training_state.critic_state.params["s_encoder"],
+            training_state.critic_state.params["g_encoder"]
+        )
+
+        s_repr = s_encoder.apply(s_encoder_params, states)
+        w_repr = g_encoder.apply(g_encoder_params, w_candidates[:, args.goal_start_idx:args.goal_end_idx])
+        sw_logits = -jnp.sqrt(jnp.sum((s_repr[:, None] - w_repr[None, :]) ** 2, axis=-1))  # (B, N)
+
+        w_repr = s_encoder.apply(s_encoder_params, w_candidates)
+        g_repr = g_encoder.apply(g_encoder_params, goals)
+        wg_logits = -jnp.sqrt(jnp.sum((w_repr[:, None] - g_repr[None, :]) ** 2, axis=-1))  # (N, B)
+
+        # resampling importance sampling
+        log_scores = sw_logits + wg_logits.transpose(1, 0)  # (B, N)
+        # scores = jax.nn.softmax(scores, axis=-1)
+        # w_idxs = jnp.argmax(scores, axis=-1)  # (B,)
+        w_idxs = jax.random.categorical(key, log_scores, axis=-1)
+        waypoint = w_candidates[w_idxs][:, args.goal_start_idx:args.goal_end_idx]  # (B,)
+
+        env_state_with_waypoint = env_state.replace(
+            obs=jnp.concatenate([env_state.obs[:, :args.obs_dim], waypoint], axis=-1))
+        return env_state_with_waypoint
+
     @jax.jit
-    def get_experience(actor_state, env_state, buffer_state, key):
+    def get_experience(training_state, env_state, buffer_state, planning_state, key, use_planner=False):
         @jax.jit
         def f(carry, unused_t):
-            env_state, current_key = carry
-            current_key, next_key = jax.random.split(current_key)
-            env_state, transition = actor_step(actor_state, env, env_state, current_key,
-                                               extra_fields=("truncation", "seed"))
-            return (env_state, next_key), transition
+            env_state, planning_state, current_key = carry
+            next_key, planning_key = jax.random.split(current_key)
 
-        (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=args.unroll_length)
+            env_state = jax.lax.cond(
+                use_planner,
+                planner_step,
+                lambda es, ps, k: es,
+                env_state, planning_state, planning_key
+            )
+            env_state, transition = actor_step(training_state, env, env_state, current_key,
+                                               extra_fields=("truncation", "seed"))
+            return (env_state, planning_state, next_key), transition
+
+        # @jax.jit
+        # def sample_transitions(replay_buffer, buffer_state, key):
+        #     buffer_state, transitions = replay_buffer.sample(buffer_state)
+        #
+        #     # process transitions for training
+        #     key, batch_key, perm_key = jax.random.split(key, 3)
+        #     batch_keys = jax.random.split(batch_key, transitions.observation.shape[0])
+        #     transitions = jax.vmap(TrajectoryUniformSamplingQueue.flatten_crl_fn, in_axes=(None, 0, 0))(
+        #         (args.gamma, args.obs_dim, args.goal_start_idx, args.goal_end_idx), transitions, batch_keys
+        #     )
+        #
+        #     transitions = jax.tree_util.tree_map(
+        #         lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"),
+        #         transitions,
+        #     )
+        #     permutation = jax.random.permutation(perm_key, len(transitions.observation))
+        #     transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
+        #     transitions = jax.tree_util.tree_map(
+        #         lambda x: x[:args.num_candidates],
+        #         transitions
+        #     )
+        #
+        #     return buffer_state, transitions
+
+        # key, sampling_key = jax.random.split(key, 2)
+        # buffer_state, waypoint_transitions = sample_transitions(
+        #     replay_buffer, buffer_state, sampling_key)
+        #
+        # planning_state = planning_state.replace(
+        #     candidate_obs=waypoint_transitions.observation[:, :args.obs_dim],
+        # )
+
+        (env_state, planning_state, _), data = jax.lax.scan(
+            f, (env_state, planning_state, key), (),
+            length=args.unroll_length)
 
         buffer_state = replay_buffer.insert(buffer_state, data)
-        return env_state, buffer_state
+        return env_state, buffer_state, planning_state
 
-
-    def prefill_replay_buffer(training_state, env_state, buffer_state, key):
+    def prefill_replay_buffer(training_state, env_state, buffer_state, planning_state, key):
         @jax.jit
         def f(carry, unused):
             del unused
-            training_state, env_state, buffer_state, key = carry
+            training_state, env_state, buffer_state, planning_state, key = carry
             key, new_key = jax.random.split(key)
-            env_state, buffer_state = get_experience(
-                training_state.actor_state,
+            env_state, buffer_state, planning_state = get_experience(
+                training_state,
                 env_state,
                 buffer_state,
+                planning_state,
                 key,
+                use_planner=False,
             )
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + args.env_steps_per_actor_step,
             )
-            return (training_state, env_state, buffer_state, new_key), ()
+            return (training_state, env_state, buffer_state, planning_state, new_key), ()
 
-        return jax.lax.scan(f, (training_state, env_state, buffer_state, key), (), length=args.num_prefill_actor_steps)[
-            0]
+        return jax.lax.scan(f, (training_state, env_state, buffer_state, planning_state, key), (),
+                            length=args.num_prefill_actor_steps)[0]
 
 
     @jax.jit
@@ -492,8 +540,9 @@ if __name__ == "__main__":
         def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
             obs = transitions.observation  # expected_shape = batch_size, obs_size + goal_size
             state = obs[:, :args.obs_dim]
-            future_goal = transitions.extras["future_state"][:, args.goal_start_idx: args.goal_end_idx]
-            observation = jnp.concatenate([state, future_goal], axis=1)
+            future_state = transitions.extras["future_state"]
+            goal = future_state[:, args.goal_start_idx: args.goal_end_idx]
+            observation = jnp.concatenate([state, goal], axis=1)
 
             means, log_stds = actor.apply(actor_params, observation)
             stds = jnp.exp(log_stds)
@@ -503,11 +552,11 @@ if __name__ == "__main__":
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sag_encoder_params, sf_encoder_params = critic_params["sag_encoder"], critic_params["sf_encoder"]
-            sag_repr = sag_encoder.apply(sag_encoder_params, state, action, future_goal)
-            g_repr = sf_encoder.apply(sf_encoder_params, future_goal)
+            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
+            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+            g_repr = g_encoder.apply(g_encoder_params, goal)
 
-            qf_pi = -jnp.sqrt(jnp.sum((sag_repr - g_repr) ** 2, axis=-1))
+            qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
 
@@ -541,46 +590,68 @@ if __name__ == "__main__":
     @jax.jit
     def update_critic(transitions, training_state, key):
         def critic_loss(critic_params, transitions, key):
-            sag_encoder_params, sf_encoder_params = critic_params["sag_encoder"], critic_params["sf_encoder"]
+            sa_encoder_params, s_encoder_params, g_encoder_params = (
+                critic_params["sa_encoder"],
+                critic_params["s_encoder"],
+                critic_params["g_encoder"]
+            )
 
             obs = transitions.observation[:, :args.obs_dim]
             action = transitions.action
-            commanded_goal = transitions.extras["commanded_state"][:, args.goal_start_idx: args.goal_end_idx]
-            future_goal = transitions.extras["future_state"][:, args.goal_start_idx: args.goal_end_idx]
 
-            sag_repr = sag_encoder.apply(sag_encoder_params, obs, action, commanded_goal)
-            sf_repr = sf_encoder.apply(sf_encoder_params, future_goal)
+            sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
+            s_repr = s_encoder.apply(s_encoder_params, obs)
+            g_repr = g_encoder.apply(g_encoder_params, transitions.observation[:, args.obs_dim:])
 
             # InfoNCE
-            logits = -jnp.sqrt(jnp.sum((sag_repr[:, None, :] - sf_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
-            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+            I = jnp.eye(obs.shape[0])
+            sag_logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
+            sg_logits = -jnp.sqrt(jnp.sum((s_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+            sag_critic_loss = jnp.mean(optax.softmax_cross_entropy(sag_logits, I))
+            sg_critic_loss = jnp.mean(optax.softmax_cross_entropy(sg_logits, I))
+            critic_loss = sag_critic_loss + sg_critic_loss
 
             # logsumexp regularisation
-            logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
+            sag_logsumexp = jax.nn.logsumexp(sag_logits + 1e-6, axis=1)
+            sg_logsumexp = jax.nn.logsumexp(sg_logits + 1e-6, axis=1)
+            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sag_logsumexp ** 2)
+            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sg_logsumexp ** 2)
 
-            I = jnp.eye(logits.shape[0])
-            correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
-            logits_pos = jnp.sum(logits * I) / jnp.sum(I)
-            logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+            sag_correct = jnp.argmax(sag_logits, axis=1) == jnp.argmax(I, axis=1)
+            sag_logits_pos = jnp.sum(sag_logits * I) / jnp.sum(I)
+            sag_logits_neg = jnp.sum(sag_logits * (1 - I)) / jnp.sum(1 - I)
 
-            return critic_loss, (logsumexp, I, correct, logits_pos, logits_neg)
+            return critic_loss, (critic_loss, sag_critic_loss, sg_critic_loss,
+                                 sag_logsumexp.mean(), sg_logsumexp.mean(),
+                                 sag_correct, sag_logits_pos, sag_logits_neg)
 
-        (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(critic_loss, has_aux=True)(
+        (loss, (critic_loss, sag_critic_loss, sg_critic_loss,
+                sag_logsumexp, sg_logsumexp, sag_correct,
+                sag_logits_pos, sag_logits_neg)), grad = jax.value_and_grad(critic_loss, has_aux=True)(
             training_state.critic_state.params, transitions, key)
         new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
         training_state = training_state.replace(critic_state=new_critic_state)
 
         metrics = {
-            "categorical_accuracy": jnp.mean(correct),
-            "logits_pos": logits_pos,
-            "logits_neg": logits_neg,
-            "logsumexp": logsumexp.mean(),
-            "critic_loss": loss,
+            "critic_loss": critic_loss,
+            "sag_critic_loss": sag_critic_loss,
+            "sg_critic_loss": sg_critic_loss,
+            "sag_logsumexp": sag_logsumexp,
+            "sg_logsumexp": sg_logsumexp,
+            "sag_correct": sag_correct,
+            "sag_logits_pos": sag_logits_pos,
+            "sag_logits_neg": sag_logits_neg,
         }
 
         return training_state, metrics
 
+    @jax.jit
+    def update_planning_state(transitions, training_state, planning_state):
+        planning_state = planning_state.replace(
+            candidate_obs=transitions.observation[:, :args.obs_dim],
+        )
+
+        return training_state, planning_state
 
     @jax.jit
     def sgd_step(carry, transitions):
@@ -599,17 +670,18 @@ if __name__ == "__main__":
 
         return (training_state, key,), metrics
 
-
     @jax.jit
-    def training_step(training_state, env_state, buffer_state, key):
+    def training_step(training_state, env_state, buffer_state, planning_state, key):
         experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
 
         # update buffer
-        env_state, buffer_state = get_experience(
-            training_state.actor_state,
+        env_state, buffer_state, planning_state = get_experience(
+            training_state,
             env_state,
             buffer_state,
+            planning_state,
             experience_key1,
+            use_planner=args.train_planner,
         )
 
         training_state = training_state.replace(
@@ -631,6 +703,10 @@ if __name__ == "__main__":
         )
         permutation = jax.random.permutation(experience_key2, len(transitions.observation))
         transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
+        waypoint_transitions = jax.tree_util.tree_map(
+            lambda x: x[:args.num_candidates],
+            transitions,
+        )
         transitions = jax.tree_util.tree_map(
             lambda x: jnp.reshape(x, (-1, args.batch_size) + x.shape[1:]),
             transitions,
@@ -639,39 +715,44 @@ if __name__ == "__main__":
         # take actor-step worth of training-step
         (training_state, _,), metrics = jax.lax.scan(sgd_step, (training_state, training_key), transitions)
 
-        return (training_state, env_state, buffer_state,), metrics
+        # update planning state
+        training_state, planning_state = update_planning_state(
+            waypoint_transitions, training_state, planning_state)
 
+        return (training_state, env_state, buffer_state, planning_state), metrics
 
     @jax.jit
     def training_epoch(
-            training_state,
-            env_state,
-            buffer_state,
-            key,
+        training_state,
+        env_state,
+        buffer_state,
+        planning_state,
+        key,
     ):
         @jax.jit
         def f(carry, unused_t):
-            ts, es, bs, k = carry
+            ts, es, bs, ps, k = carry
             k, train_key = jax.random.split(k, 2)
-            (ts, es, bs,), metrics = training_step(ts, es, bs, train_key)
-            return (ts, es, bs, k), metrics
+            (ts, es, bs, ps), metrics = training_step(ts, es, bs, ps, train_key)
+            return (ts, es, bs, ps, k), metrics
 
-        (training_state, env_state, buffer_state, key), metrics = jax.lax.scan(f, (
-        training_state, env_state, buffer_state, key), (), length=args.num_training_steps_per_epoch)
+        (training_state, env_state, buffer_state, planning_state, key), metrics = jax.lax.scan(f, (
+            training_state, env_state, buffer_state, planning_state, key), (), length=args.num_training_steps_per_epoch)
 
         metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
-        return training_state, env_state, buffer_state, metrics
+        return training_state, env_state, buffer_state, planning_state, metrics
 
 
     key, prefill_key = jax.random.split(key, 2)
 
-    training_state, env_state, buffer_state, _ = prefill_replay_buffer(
-        training_state, env_state, buffer_state, prefill_key
+    training_state, env_state, buffer_state, planning_state, _ = prefill_replay_buffer(
+        training_state, env_state, buffer_state, planning_state, prefill_key
     )
 
     '''Setting up evaluator'''
-    evaluator = CrlEvaluator(
+    evaluator = CrlPlanningEvaluator(
         deterministic_actor_step,
+        planner_step if args.eval_planner else lambda s, ps: s,
         env,
         num_eval_envs=args.num_eval_envs,
         episode_length=args.episode_length,
@@ -685,8 +766,8 @@ if __name__ == "__main__":
         t = time.time()
 
         key, epoch_key = jax.random.split(key)
-        training_state, env_state, buffer_state, metrics = training_epoch(training_state, env_state, buffer_state,
-                                                                          epoch_key)
+        training_state, env_state, buffer_state, planning_state, metrics = training_epoch(
+            training_state, env_state, buffer_state, planning_state, epoch_key)
 
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
@@ -702,12 +783,12 @@ if __name__ == "__main__":
             **{f"training/{name}": value for name, value in metrics.items()},
         }
 
-        metrics, stats = evaluator.run_evaluation(training_state, metrics)
+        metrics, stats = evaluator.run_evaluation(training_state, planning_state, metrics)
         if args.track:
             # plot trajectories
             import matplotlib.pyplot as plt
-
-            fig = plot_trajectories(args.num_eval_vis, stats, use_planner=False)
+            fig = plot_trajectories(args.num_eval_vis, stats, use_planner=args.eval_planner)
+            # fig.savefig("/home/cz8792/research/JaxGCRL/debug_figs/traj.pdf")
             wandb.log({"evaluation_trajectory": wandb.Image(fig)}, step=ne)
             plt.close(fig)
 
@@ -743,8 +824,50 @@ if __name__ == "__main__":
             path = f"{save_path}/final_rb.pkl"
             save_params(path, buffer_state)
 
+    def render(actor_state, env, exp_dir, exp_name, deterministic=True,
+               wandb_track=False):
+        def actor_sample(observations, key, deterministic=deterministic):
+            means, log_stds = actor.apply(actor_state.params, observations)
+            if deterministic:
+                actions = nn.tanh(means)
+            else:
+                stds = jnp.exp(log_stds)
+                actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
+
+            return actions, {}
+
+        jit_env_reset = jax.jit(env.reset)
+        jit_env_step = jax.jit(env.step)
+        jit_inference_fn = jax.jit(actor_sample)
+
+        rollout = []
+        rng = jax.random.PRNGKey(seed=1)
+        rngs = jax.random.split(rng, 1)
+        state = jit_env_reset(rng=rngs)
+        for i in range(5000):
+            rollout.append(
+                jax.tree_util.tree_map(jnp.squeeze, state.pipeline_state))
+            act_rng, rng = jax.random.split(rng)
+            act_rngs = jax.random.split(act_rng, 1)
+            act, _ = jit_inference_fn(state.obs, act_rngs)
+            state = jit_env_step(state, act)
+            if i % 1000 == 0:
+                rngs = jax.random.split(rng, 1)
+                state = jit_env_reset(rng=rngs)
+
+        url = html.render(env.sys.replace(dt=env.dt), rollout, height=480)
+        with open(os.path.join(exp_dir, f"{exp_name}.html"), "w") as file:
+            file.write(url)
+        if wandb_track:
+            wandb.log({"render": wandb.Html(url)})
+
     render(training_state.actor_state, env, save_path, args.exp_name,
            wandb_track=args.track)
+
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    with jax.disable_jit(args.debug):
+        main(args)
 
 # (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)
 # 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step 

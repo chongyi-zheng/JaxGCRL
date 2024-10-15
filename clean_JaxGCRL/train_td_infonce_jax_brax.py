@@ -598,23 +598,7 @@ if __name__ == "__main__":
             loss = (1 - args.gamma) * loss1 + args.gamma * loss2
             loss = jnp.mean(loss)
 
-            # sag_repr = sag_encoder.apply(sag_encoder_params, obs, action)
-            # g_repr = g_encoder.apply(g_encoder_params, transitions.observation[:, args.obs_dim:])
-            #
-            # # InfoNCE
-            # logits = -jnp.sqrt(jnp.sum((sag_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
-            # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
-            #
-            # # logsumexp regularisation
-            # logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-            # critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
-            #
-            # I = jnp.eye(logits.shape[0])
-            # correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
-            # logits_pos = jnp.sum(logits * I) / jnp.sum(I)
-            # logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
-
-            return loss, (loss1, loss2, logits_pos, logits_neg, jnp.mean(w))
+            return loss, (loss1, loss2, jnp.mean(jnp.diag(logits_pos)), jnp.mean(logits_neg), jnp.mean(w))
 
         (loss, (loss1, loss2, logits_pos, logits_neg, w)), grad = jax.value_and_grad(critic_loss, has_aux=True)(
             training_state.critic_state.params, training_state.actor_state.params, transitions, key)
@@ -806,6 +790,6 @@ if __name__ == "__main__":
     render(training_state.actor_state, env, save_path, args.exp_name,
            wandb_track=args.track)
 
-# (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)
+# (50000000 - 1024 x 1000) / (50 x 1024 x 62)        #number of actor steps per epoch (which is equal to the number of training steps)
 # 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step 
 # 1024 x 62 / 4000 = 16                                 #ratio of env steps per gradient step

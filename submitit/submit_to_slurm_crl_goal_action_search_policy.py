@@ -23,23 +23,23 @@ def main():
 
     executor = submitit.AutoExecutor(folder="/tmp/submitit_logs")  # this path is not actually used.
     executor.update_parameters(
-        slurm_name="jax_gcrl_crl",
+        slurm_name="crl_ga",
         slurm_time=3 * 60,  # minute
         slurm_partition=partition,
         slurm_nodes=1,
         slurm_ntasks_per_node=1,  # tasks can share nodes
         slurm_cpus_per_task=8,
-        slurm_mem="16G",
+        slurm_mem="32G",
         # slurm_mem_per_cpu="1G",
         slurm_gpus_per_node=1,
         slurm_stderr_to_stdout=True,
     )
 
     with executor.batch():  # job array
-        for env_id in ["ant_randomized_u_maze"]:
+        for env_id in ["ant_randomized_init_u_maze"]:
             for train_planner in ["train_planner"]:
-                for eval_planner in ["eval_planner"]:
-                    for max_edge_dist in [1.0, 2.0, 2.5]:
+                for eval_planner in ["no-eval_planner"]:
+                    for max_edge_dist in [3.0, 4.0, 5.0]:
                         for total_env_steps in [100_000_000]:
                             for seed in [0]:
                                 exp_name = f"phi_sa_psi_phi_gag_sg_forward_infonce_planner={train_planner}_{eval_planner}_max_edge_dist={max_edge_dist}"

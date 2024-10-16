@@ -598,47 +598,47 @@ def main(args):
             )
 
             obs = transitions.observation[:, :args.obs_dim]
+            future_goal = transitions.extras["future_state"][:, args.goal_start_idx: args.goal_end_idx]
+            future_state = transitions.extras["future_state"]
             action = transitions.action
 
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
+            g_repr = g_encoder.apply(g_encoder_params, future_goal)
             s_repr = s_encoder.apply(s_encoder_params, obs)
-            g_repr = g_encoder.apply(g_encoder_params, transitions.observation[:, args.obs_dim:])
+            sf_repr = s_encoder.apply(s_encoder_params, future_state)
 
             # InfoNCE
             I = jnp.eye(obs.shape[0])
-            sag_logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
-            sg_logits = -jnp.sqrt(jnp.sum((s_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+            sag_logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+            ssf_logits = -jnp.sqrt(jnp.sum((s_repr[:, None, :] - sf_repr[None, :, :]) ** 2, axis=-1))
             sag_critic_loss = jnp.mean(optax.softmax_cross_entropy(sag_logits, I))
-            sg_critic_loss = jnp.mean(optax.softmax_cross_entropy(sg_logits, I))
-            critic_loss = sag_critic_loss + sg_critic_loss
+            ssf_critic_loss = jnp.mean(optax.softmax_cross_entropy(ssf_logits, I))
+            critic_loss = sag_critic_loss + ssf_critic_loss
 
             # logsumexp regularisation
             sag_logsumexp = jax.nn.logsumexp(sag_logits + 1e-6, axis=1)
-            sg_logsumexp = jax.nn.logsumexp(sg_logits + 1e-6, axis=1)
+            # sg_logsumexp = jax.nn.logsumexp(sg_logits + 1e-6, axis=1)
             critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sag_logsumexp ** 2)
-            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sg_logsumexp ** 2)
+            # critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sg_logsumexp ** 2)
 
             sag_correct = jnp.argmax(sag_logits, axis=1) == jnp.argmax(I, axis=1)
             sag_logits_pos = jnp.sum(sag_logits * I) / jnp.sum(I)
             sag_logits_neg = jnp.sum(sag_logits * (1 - I)) / jnp.sum(1 - I)
 
-            return critic_loss, (critic_loss, sag_critic_loss, sg_critic_loss,
-                                 sag_logsumexp.mean(), sg_logsumexp.mean(),
-                                 sag_correct, sag_logits_pos, sag_logits_neg)
+            return critic_loss, (critic_loss, sag_critic_loss, ssf_critic_loss,
+                                 sag_logsumexp.mean(), sag_correct, sag_logits_pos, sag_logits_neg)
 
-        (loss, (critic_loss, sag_critic_loss, sg_critic_loss,
-                sag_logsumexp, sg_logsumexp, sag_correct,
-                sag_logits_pos, sag_logits_neg)), grad = jax.value_and_grad(critic_loss, has_aux=True)(
-            training_state.critic_state.params, transitions, key)
+        (loss, (critic_loss, sag_critic_loss, ssf_critic_loss,
+            sag_logsumexp, sag_correct, sag_logits_pos, sag_logits_neg)), grad = jax.value_and_grad(
+            critic_loss, has_aux=True)(training_state.critic_state.params, transitions, key)
         new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
         training_state = training_state.replace(critic_state=new_critic_state)
 
         metrics = {
             "critic_loss": critic_loss,
             "sag_critic_loss": sag_critic_loss,
-            "sg_critic_loss": sg_critic_loss,
+            "ssf_critic_loss": ssf_critic_loss,
             "sag_logsumexp": sag_logsumexp,
-            "sg_logsumexp": sg_logsumexp,
             "sag_correct": sag_correct,
             "sag_logits_pos": sag_logits_pos,
             "sag_logits_neg": sag_logits_neg,

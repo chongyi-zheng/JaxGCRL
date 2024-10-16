@@ -753,7 +753,7 @@ def main(args):
     '''Setting up evaluator'''
     evaluator = CrlPlanningEvaluator(
         deterministic_actor_step,
-        planner_step if args.eval_planner else lambda s, ps: s,
+        planner_step if args.eval_planner else lambda s, ps, k: s,
         env,
         num_eval_envs=args.num_eval_envs,
         episode_length=args.episode_length,

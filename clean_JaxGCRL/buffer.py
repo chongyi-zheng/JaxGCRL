@@ -222,6 +222,7 @@ class TrajectoryUniformSamplingQueue():
             "state": state,
             "next_state": next_state,
             "commanded_state": commanded_state,
+            "commanded_goal": transition.observation[:-1, obs_dim:],
             "future_state": future_state,
             "future_action": future_action,
         }

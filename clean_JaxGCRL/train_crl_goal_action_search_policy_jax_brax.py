@@ -73,7 +73,9 @@ class Args:
 
     unroll_length: int = 62
     """max distance of edges on the planning graph"""
-    max_edge_dist: float = 3.0
+    max_edge_dist: float = 4.0
+    """min distance of edges on the planning graph"""
+    min_edge_dist: float = 1.5
     """open-loop or close-loop planning"""
     open_loop: bool = False
     """number of candidate waypoints"""
@@ -497,6 +499,10 @@ def main(args):
         tx=optax.adam(learning_rate=args.alpha_lr),
     )
 
+    actor.apply = jax.jit(actor.apply)
+    sag_encoder.apply = jax.jit(sag_encoder.apply)
+    sf_encoder.apply = jax.jit(sf_encoder.apply)
+
     # Trainstate
     training_state = TrainingState(
         env_steps=jnp.zeros(()),
@@ -642,9 +648,11 @@ def main(args):
         # sg_dist = -energy_fn(s_repr[None, :], projected_g_repr[None, :]).squeeze()
 
         sw_dists = jnp.linalg.norm(state[:2][None] - planning_state.waypoint_obs[:, :2], axis=-1)
-        sw_dists = jnp.where(sw_dists < args.max_edge_dist, sw_dists, jnp.inf)
+        sw_dists = jnp.where(sw_dists <= args.max_edge_dist, sw_dists, jnp.inf)
+        sw_dists = jnp.where(sw_dists >= args.min_edge_dist, sw_dists, jnp.inf)
         wg_dists = jnp.linalg.norm(planning_state.waypoint_obs[:, :2] - goal[:2][None], axis=-1)
-        wg_dists = jnp.where(wg_dists < args.max_edge_dist, wg_dists, jnp.inf)
+        wg_dists = jnp.where(wg_dists <= args.max_edge_dist, wg_dists, jnp.inf)
+        wg_dists = jnp.where(wg_dists >= args.min_edge_dist, wg_dists, jnp.inf)
         sg_dist = jnp.linalg.norm(state[:2] - goal[:2])
 
         if args.open_loop:
@@ -723,7 +731,7 @@ def main(args):
 
         return waypoint, planning_state
 
-    def planner_step(env_state, planning_state):
+    def planner_step(env_state, planning_state, key):
         waypoint, planning_state = jax.vmap(search_waypoint, in_axes=(None, 0, None))(
             training_state, env_state, planning_state)
         env_state_with_waypoint = env_state.replace(
@@ -736,7 +744,7 @@ def main(args):
         def f(carry, unused_t):
             # add search policy here
             env_state, planning_state, current_key = carry
-            current_key, next_key = jax.random.split(current_key)
+            next_key, planning_key = jax.random.split(current_key)
 
             # def planning_f(env_state, planning_state):
             #     waypoint, planning_state = jax.vmap(search_waypoint, in_axes=(None, 0, None))(
@@ -753,8 +761,8 @@ def main(args):
                 # planning_f,
                 # planner_step,
                 planner_step,
-                lambda es, ps: es,
-                env_state, planning_state
+                lambda es, ps, k: es,
+                env_state, planning_state, planning_key
             )
             # if prefill:
             #     env_state_with_waypoint = env_state
@@ -1027,7 +1035,8 @@ def main(args):
         # w_pdists = jnp.where((w_pdists < args.max_edge_dist), w_pdists, jnp.inf)
 
         w_pdists = jnp.linalg.norm(waypoint_obs[:, :2][None] - waypoint_obs[:, :2][:, None], axis=-1)
-        w_pdists = jnp.where((w_pdists < args.max_edge_dist), w_pdists, jnp.inf)
+        w_pdists = jnp.where((w_pdists <= args.max_edge_dist), w_pdists, jnp.inf)
+        w_pdists = jnp.where((w_pdists >= args.min_edge_dist), w_pdists, jnp.inf)
 
         shortest_w_pdists, *_ = jax.vmap(bellman_ford, in_axes=(None, 0))(w_pdists, jnp.arange(w_repr.shape[0]))
         planning_state = planning_state.replace(

@@ -29,7 +29,7 @@ def main():
         slurm_nodes=1,
         slurm_ntasks_per_node=1,  # tasks can share nodes
         slurm_cpus_per_task=8,
-        slurm_mem="32G",
+        slurm_mem="16G",
         # slurm_mem_per_cpu="1G",
         slurm_gpus_per_node=1,
         slurm_stderr_to_stdout=True,

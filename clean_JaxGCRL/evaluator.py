@@ -20,7 +20,7 @@ def generate_unroll(actor_step, training_state, env, env_state, unroll_length, e
     return final_state, data
 
 
-class CrlEvaluator():
+class CrlEvaluator:
 
     def __init__(self, actor_step, eval_env, num_eval_envs, episode_length, key):
 

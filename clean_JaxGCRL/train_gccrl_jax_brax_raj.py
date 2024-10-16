@@ -1,29 +1,27 @@
 import os
+import jax
+import flax
+import tyro
+import time
+import optax
+import wandb
 import pickle
 import random
-import time
+import wandb_osh
+import numpy as np
+import jax.numpy as jnp
+import flax.linen as nn
+
+from etils import epath
 from dataclasses import dataclass
 from typing import NamedTuple, Any
-
-import flax
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
-import numpy as np
-import optax
-import tyro
-import wandb
-import wandb_osh
-from brax import envs
-from brax.io import html
-from etils import epath
-from flax.linen.initializers import variance_scaling
-from flax.training.train_state import TrainState
 from wandb_osh.hooks import TriggerWandbSyncHook
+from flax.training.train_state import TrainState
+from flax.linen.initializers import variance_scaling
 
-from buffer import TrajectoryUniformSamplingQueue
 from evaluator import CrlEvaluator
-from utils import plot_trajectories
+from buffer import TrajectoryUniformSamplingQueue
+from envs.wrappers import EpisodeWrapper, VmapWrapper, AutoResetWrapper
 
 
 @dataclass
@@ -33,15 +31,13 @@ class Args:
     torch_deterministic: bool = True
     cuda: bool = True
     track: bool = False
-    log_dir: str = '.'
     wandb_project_name: str = "exploration"
-    wandb_entity: str = 'chongyiz1'
-    wandb_mode: str = 'offline'
+    wandb_entity: str = 'raj19'
+    wandb_mode: str = 'online'
+    wandb_dir: str = '.'
     wandb_group: str = '.'
     capture_video: bool = False
-    num_epochs_per_checkpoint: int = 10
     checkpoint: bool = False
-    checkpoint_final_rb: bool = False
 
     # environment specific arguments
     env_id: str = "ant"
@@ -56,13 +52,12 @@ class Args:
     num_epochs: int = 50
     num_envs: int = 1024
     num_eval_envs: int = 128
-    num_eval_vis: int = 8
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
     batch_size: int = 256
+    rep_size: int = 64
     gamma: float = 0.99
-    repr_dim: int = 64
     logsumexp_penalty_coeff: float = 0.1
 
     max_replay_size: int = 10000
@@ -82,13 +77,13 @@ class Args:
 
 
 class SAG_encoder(nn.Module):
-    repr_dim: int = 64
-    norm_type: str = "layer_norm"
+    rep_size: int
+    norm_type = "layer_norm"
 
     @nn.compact
     def __call__(self, s: jnp.ndarray, a: jnp.ndarray, g: jnp.ndarray):
 
-        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
+        lecun_unfirom = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
 
         if self.norm_type == "layer_norm":
@@ -97,30 +92,30 @@ class SAG_encoder(nn.Module):
             normalize = lambda x: x
 
         x = jnp.concatenate([s, a, g], axis=-1)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(self.rep_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
-class SF_encoder(nn.Module):
-    repr_dim: int = 64
-    norm_type: str = "layer_norm"
+class G_encoder(nn.Module):
+    rep_size: int
+    norm_type = "layer_norm"
 
     @nn.compact
-    def __call__(self, sf: jnp.ndarray):
+    def __call__(self, g: jnp.ndarray):
 
-        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
+        lecun_unfirom = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
 
         if self.norm_type == "layer_norm":
@@ -128,57 +123,58 @@ class SF_encoder(nn.Module):
         else:
             normalize = lambda x: x
 
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(sf)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(g)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(self.repr_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(self.rep_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
 class Actor(nn.Module):
     action_size: int
-    norm_type: str = "layer_norm"
+    norm_type = "layer_norm"
 
-    log_std_max: int = 2
-    log_std_min: int = -5
+    LOG_STD_MAX = 2
+    LOG_STD_MIN = -5
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, s, g_repr):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
             normalize = lambda x: x
 
-        lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
+        lecun_unfirom = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
 
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = jnp.concatenate([s, g_repr], axis=-1)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
-        x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = nn.Dense(1024, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
 
-        mean = nn.Dense(self.action_size, kernel_init=lecun_uniform, bias_init=bias_init)(x)
-        log_std = nn.Dense(self.action_size, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        mean = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
 
         log_std = nn.tanh(log_std)
-        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (
                     log_std + 1)  # From SpinUp / Denis Yarats
 
         return mean, log_std
@@ -198,8 +194,6 @@ class Transition(NamedTuple):
     """Container for a transition"""
     observation: jnp.ndarray
     action: jnp.ndarray
-    reward: jnp.ndarray
-    discount: jnp.ndarray
     extras: jnp.ndarray = ()
 
 
@@ -215,44 +209,6 @@ def save_params(path: str, params: Any):
         fout.write(pickle.dumps(params))
 
 
-def render(actor_state, env, exp_dir, exp_name, deterministic=True,
-           wandb_track=False):
-    def actor_sample(observations, key, deterministic=deterministic):
-        means, log_stds = actor.apply(actor_state.params, observations)
-        if deterministic:
-            actions = nn.tanh(means)
-        else:
-            stds = jnp.exp(log_stds)
-            actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
-
-        return actions, {}
-
-    jit_env_reset = jax.jit(env.reset)
-    jit_env_step = jax.jit(env.step)
-    jit_inference_fn = jax.jit(actor_sample)
-
-    rollout = []
-    rng = jax.random.PRNGKey(seed=1)
-    rngs = jax.random.split(rng, 1)
-    state = jit_env_reset(rng=rngs)
-    for i in range(5000):
-        rollout.append(
-            jax.tree_util.tree_map(jnp.squeeze, state.pipeline_state))
-        act_rng, rng = jax.random.split(rng)
-        act_rngs = jax.random.split(act_rng, 1)
-        act, _ = jit_inference_fn(state.obs, act_rngs)
-        state = jit_env_step(state, act)
-        if i % 1000 == 0:
-            rngs = jax.random.split(rng, 1)
-            state = jit_env_reset(rng=rngs)
-
-    url = html.render(env.sys.replace(dt=env.dt), rollout, height=480)
-    with open(os.path.join(exp_dir, f"{exp_name}.html"), "w") as file:
-        file.write(url)
-    if wandb_track:
-        wandb.log({"render": wandb.Html(url)})
-
-
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
@@ -260,17 +216,10 @@ if __name__ == "__main__":
     args.env_steps_per_actor_step = args.num_envs * args.unroll_length
     args.num_prefill_env_steps = args.min_replay_size * args.num_envs
     args.num_prefill_actor_steps = np.ceil(args.min_replay_size / args.unroll_length)
-    args.num_training_steps_per_epoch = np.ceil(
-        (args.total_env_steps - args.num_prefill_env_steps) / (args.num_epochs * args.env_steps_per_actor_step)
-    )
+    args.num_training_steps_per_epoch = (args.total_env_steps - args.num_prefill_env_steps) // (
+                args.num_epochs * args.env_steps_per_actor_step)
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-
-    save_path = os.path.join(args.log_dir, run_name)
-    os.makedirs(save_path, exist_ok=True)
-
-    with open(os.path.join(save_path, 'args.pkl'), 'wb') as f:
-        pickle.dump(args, f)
 
     if args.track:
 
@@ -282,7 +231,7 @@ if __name__ == "__main__":
             entity=args.wandb_entity,
             mode=args.wandb_mode,
             group=args.wandb_group,
-            dir=save_path,
+            dir=args.wandb_dir,
             config=vars(args),
             name=run_name,
             monitor_gym=True,
@@ -293,14 +242,20 @@ if __name__ == "__main__":
             wandb_osh.set_log_level("ERROR")
             trigger_sync = TriggerWandbSyncHook()
 
+    if args.checkpoint:
+        from pathlib import Path
+
+        save_path = Path(args.wandb_dir) / Path(run_name)
+        os.mkdir(path=save_path)
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, buffer_key, env_key, eval_env_key, actor_key, sag_key, sf_key = jax.random.split(key, 7)
+    key, buffer_key, env_key, eval_env_key, actor_key, sag_key, g_key = jax.random.split(key, 7)
 
-    # Environment setup    
+    # Environment setup
     if args.env_id == "ant":
-        from clean_JaxGCRL.envs.ant import Ant
+        from envs.ant import Ant
 
         env = Ant(
             backend="spring",
@@ -312,8 +267,8 @@ if __name__ == "__main__":
         args.goal_start_idx = 0
         args.goal_end_idx = 2
 
-    elif "maze" in args.env_id:
-        from clean_JaxGCRL.envs.ant_maze import AntMaze
+    elif "maze" in args.env_id and "ant" in args.env_id:
+        from envs.ant_maze import AntMaze
 
         env = AntMaze(
             backend="spring",
@@ -326,13 +281,65 @@ if __name__ == "__main__":
         args.goal_start_idx = 0
         args.goal_end_idx = 2
 
+    elif args.env_id == "ant_push":
+        from envs.ant_push import AntPush
+
+        env = AntPush(
+            backend="mjx",
+            exclude_current_positions_from_observation=False,
+            terminate_when_unhealthy=True,
+        )
+
+        args.obs_dim = 31
+        args.goal_start_idx = 0
+        args.goal_end_idx = 2
+
+    elif args.env_id == "ant_push_diverse":
+        from envs.ant_push_diverse import AntPushDiverse
+
+        env = AntPushDiverse(
+            backend="mjx",
+            exclude_current_positions_from_observation=False,
+            terminate_when_unhealthy=True,
+        )
+
+        args.obs_dim = 31
+        args.goal_start_idx = 0
+        args.goal_end_idx = 2
+
+    elif args.env_id == "ant_ball":
+        from envs.ant_ball import AntBall
+
+        env = AntBall(backend="spring")
+
+        args.obs_dim = 31
+        args.goal_start_idx = -4
+        args.goal_end_idx = -2
+
+    elif args.env_id == "humanoid":
+        from envs.humanoid import Humanoid
+
+        env = Humanoid(backend="generalized")
+
+        args.obs_dim = 268
+        args.goal_start_idx = 0
+        args.goal_end_idx = 3
+
+    elif args.env_id == "humanoid_standup":
+        from envs.humanoid_standup import HumanoidStandup
+
+        env = HumanoidStandup(backend="generalized")
+
+        args.obs_dim = 244
+        args.goal_start_idx = 0
+        args.goal_end_idx = 1
+
     else:
         raise NotImplementedError
 
-    env = envs.training.wrap(
-        env,
-        episode_length=args.episode_length,
-    )
+    env = EpisodeWrapper(env, args.episode_length, action_repeat=1)
+    env = VmapWrapper(env)
+    env = AutoResetWrapper(env)
 
     obs_size = env.observation_size
     action_size = env.action_size
@@ -345,21 +352,20 @@ if __name__ == "__main__":
     actor = Actor(action_size=action_size)
     actor_state = TrainState.create(
         apply_fn=actor.apply,
-        params=actor.init(actor_key, np.ones([1, obs_size])),
+        params=actor.init(actor_key, np.ones([1, args.obs_dim]), np.ones([1, args.rep_size])),
         tx=optax.adam(learning_rate=args.actor_lr)
     )
 
     # Critic
-    sag_encoder = SAG_encoder(repr_dim=args.repr_dim)
-    sag_encoder_params = sag_encoder.init(
-        sag_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]),
-        np.ones([1, args.goal_end_idx - args.goal_start_idx]))
-    sf_encoder = SF_encoder(repr_dim=args.repr_dim)
-    sf_encoder_params = sf_encoder.init(
-        sf_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
+    sag_encoder = SAG_encoder(rep_size=args.rep_size)
+    sag_encoder_params = sag_encoder.init(sag_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]),
+                                          np.ones([1, args.goal_end_idx - args.goal_start_idx]))
+    g_encoder = G_encoder(rep_size=args.rep_size)
+    g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
+    c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
-        params={"sag_encoder": sag_encoder_params, "sf_encoder": sf_encoder_params},
+        params={"sag_encoder": sag_encoder_params, "g_encoder": g_encoder_params},
         tx=optax.adam(learning_rate=args.critic_lr),
     )
 
@@ -374,7 +380,7 @@ if __name__ == "__main__":
 
     actor.apply = jax.jit(actor.apply)
     sag_encoder.apply = jax.jit(sag_encoder.apply)
-    sf_encoder.apply = jax.jit(sf_encoder.apply)
+    g_encoder.apply = jax.jit(g_encoder.apply)
 
     # Trainstate
     training_state = TrainingState(
@@ -392,20 +398,17 @@ if __name__ == "__main__":
     dummy_transition = Transition(
         observation=dummy_obs,
         action=dummy_action,
-        reward=jnp.zeros(()),
-        discount=jnp.zeros(()),
         extras={
             "state_extras": {
-                "truncation": jnp.zeros(()),
-                "seed": jnp.zeros(()),
+                "seed": 0.0,
             }
         },
     )
 
 
     def jit_wrap(buffer):
-        buffer.insert_internal = jax.jit(buffer.insert_internal)
-        buffer.sample_internal = jax.jit(buffer.sample_internal)
+        buffer.insert = jax.jit(buffer.insert)
+        buffer.sample = jax.jit(buffer.sample)
         return buffer
 
 
@@ -415,59 +418,71 @@ if __name__ == "__main__":
             dummy_data_sample=dummy_transition,
             sample_batch_size=args.batch_size,
             num_envs=args.num_envs,
-            episode_length=args.episode_length,
+            sequence_length=args.episode_length,
         )
     )
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
-        means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
+        """Function to collect data during evaluation. Used in evaluator.py"""
+
+        obs = env_state.obs
+        state = obs[:, :args.obs_dim]
+        commanded_goal = obs[:, args.obs_dim:]
+
+        commanded_g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], commanded_goal)
+
+        means, _ = actor_state.apply_fn(training_state.actor_state.params, state, commanded_g_repr)
         actions = nn.tanh(means)
 
         nstate = env.step(env_state, actions)
         state_extras = {x: nstate.info[x] for x in extra_fields}
-
         return nstate, Transition(
             observation=env_state.obs,
             action=actions,
-            reward=nstate.reward,
-            discount=1 - nstate.done,
-            extras={"state_extras": state_extras},
-        )
+            extras={
+                'state_extras': state_extras
+            })
 
 
-    def actor_step(actor_state, env, env_state, key, extra_fields):
-        means, log_stds = actor.apply(actor_state.params, env_state.obs)
+    def actor_step(training_state, env, env_state, key, extra_fields):
+        g_encoder_params = training_state.critic_state.params["g_encoder"]
+
+        obs = env_state.obs
+        state = obs[:, :args.obs_dim]
+        commanded_goal = obs[:, args.obs_dim:]
+        commanded_g_repr = g_encoder.apply(g_encoder_params, commanded_goal)
+
+        means, log_stds = actor.apply(training_state.actor_state.params, state, commanded_g_repr)
         stds = jnp.exp(log_stds)
         actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
 
         nstate = env.step(env_state, actions)
         state_extras = {x: nstate.info[x] for x in extra_fields}
 
-        return nstate, Transition(
+        return training_state, nstate, Transition(
             observation=env_state.obs,
             action=actions,
-            reward=nstate.reward,
-            discount=1 - nstate.done,
             extras={"state_extras": state_extras},
         )
 
 
     @jax.jit
-    def get_experience(actor_state, env_state, buffer_state, key):
+    def get_experience(training_state, env_state, buffer_state, key):
         @jax.jit
         def f(carry, unused_t):
-            env_state, current_key = carry
+            training_state, env_state, current_key = carry
             current_key, next_key = jax.random.split(current_key)
-            env_state, transition = actor_step(actor_state, env, env_state, current_key,
-                                               extra_fields=("truncation", "seed"))
-            return (env_state, next_key), transition
+            training_state, env_state, transition = actor_step(training_state, env, env_state, current_key,
+                                                               extra_fields=("seed",))
+            return (training_state, env_state, next_key), transition
 
-        (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=args.unroll_length)
+        (training_state, env_state, _), data = jax.lax.scan(f, (training_state, env_state, key), (),
+                                                            length=args.unroll_length)
 
         buffer_state = replay_buffer.insert(buffer_state, data)
-        return env_state, buffer_state
+        return training_state, env_state, buffer_state
 
 
     def prefill_replay_buffer(training_state, env_state, buffer_state, key):
@@ -476,11 +491,12 @@ if __name__ == "__main__":
             del unused
             training_state, env_state, buffer_state, key = carry
             key, new_key = jax.random.split(key)
-            env_state, buffer_state = get_experience(
-                training_state.actor_state,
+            training_state, env_state, buffer_state = get_experience(
+                training_state,
                 env_state,
                 buffer_state,
                 key,
+
             )
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + args.env_steps_per_actor_step,
@@ -494,12 +510,14 @@ if __name__ == "__main__":
     @jax.jit
     def update_actor_and_alpha(transitions, training_state, key):
         def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
-            obs = transitions.observation  # expected_shape = batch_size, obs_size + goal_size
-            state = obs[:, :args.obs_dim]
-            future_goal = transitions.extras["future_state"][:, args.goal_start_idx: args.goal_end_idx]
-            observation = jnp.concatenate([state, future_goal], axis=1)
+            state = transitions.extras["state"]
+            goal = transitions.extras["goal"]
+            sag_encoder_params, g_encoder_params = jax.lax.stop_gradient(
+                critic_params["sag_encoder"]), jax.lax.stop_gradient(critic_params["g_encoder"])
 
-            means, log_stds = actor.apply(actor_params, observation)
+            g_repr = g_encoder.apply(g_encoder_params, goal)
+
+            means, log_stds = actor.apply(actor_params, state, g_repr)
             stds = jnp.exp(log_stds)
             x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
             action = nn.tanh(x_ts)
@@ -507,10 +525,7 @@ if __name__ == "__main__":
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sag_encoder_params, sf_encoder_params = critic_params["sag_encoder"], critic_params["sf_encoder"]
-            sag_repr = sag_encoder.apply(sag_encoder_params, state, action, future_goal)
-            g_repr = sf_encoder.apply(sf_encoder_params, future_goal)
-
+            sag_repr = sag_encoder.apply(sag_encoder_params, state, action, goal)
             qf_pi = -jnp.sqrt(jnp.sum((sag_repr - g_repr) ** 2, axis=-1))
 
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
@@ -522,20 +537,20 @@ if __name__ == "__main__":
             alpha_loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - target_entropy))
             return jnp.mean(alpha_loss)
 
-        (actor_l, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
+        (actorloss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
             training_state.actor_state.params, training_state.critic_state.params,
             training_state.alpha_state.params['log_alpha'], transitions, key)
         new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
 
-        alpha_l, alpha_grad = jax.value_and_grad(alpha_loss)(training_state.alpha_state.params, log_prob)
+        alphaloss, alpha_grad = jax.value_and_grad(alpha_loss)(training_state.alpha_state.params, log_prob)
         new_alpha_state = training_state.alpha_state.apply_gradients(grads=alpha_grad)
 
         training_state = training_state.replace(actor_state=new_actor_state, alpha_state=new_alpha_state)
 
         metrics = {
             "sample_entropy": -log_prob,
-            "actor_loss": actor_l,
-            "alpha_loss": alpha_l,
+            "actor_loss": actorloss,
+            "alpha_aloss": alphaloss,
             "log_alpha": training_state.alpha_state.params["log_alpha"],
         }
 
@@ -545,18 +560,19 @@ if __name__ == "__main__":
     @jax.jit
     def update_critic(transitions, training_state, key):
         def critic_loss(critic_params, transitions, key):
-            sag_encoder_params, sf_encoder_params = critic_params["sag_encoder"], critic_params["sf_encoder"]
+            sag_encoder_params, g_encoder_params = critic_params["sag_encoder"], critic_params["g_encoder"]
 
-            obs = transitions.observation[:, :args.obs_dim]
+            state = transitions.extras["state"]
             action = transitions.action
-            commanded_goal = transitions.extras["commanded_state"][:, args.goal_start_idx: args.goal_end_idx]
-            future_goal = transitions.extras["future_state"][:, args.goal_start_idx: args.goal_end_idx]
+            commanded_goal = transitions.extras["commanded_goal"]
+            goal = transitions.extras["goal"]
 
-            sag_repr = sag_encoder.apply(sag_encoder_params, obs, action, commanded_goal)
-            sf_repr = sf_encoder.apply(sf_encoder_params, future_goal)
+            sag_repr = sag_encoder.apply(sag_encoder_params, state, action, commanded_goal)
+            g_repr = g_encoder.apply(g_encoder_params, goal)
 
             # InfoNCE
-            logits = -jnp.sqrt(jnp.sum((sag_repr[:, None, :] - sf_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
+            logits = -jnp.sqrt(jnp.sum((sag_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
+
             critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
 
             # logsumexp regularisation
@@ -570,7 +586,7 @@ if __name__ == "__main__":
 
             return critic_loss, (logsumexp, correct, logits_pos, logits_neg)
 
-        (critic_l, (logsumexp, I, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(critic_loss, has_aux=True)(
+        (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(critic_loss, has_aux=True)(
             training_state.critic_state.params, transitions, key)
         new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
         training_state = training_state.replace(critic_state=new_critic_state)
@@ -580,7 +596,7 @@ if __name__ == "__main__":
             "logits_pos": logits_pos,
             "logits_neg": logits_neg,
             "logsumexp": logsumexp.mean(),
-            "critic_loss": critic_l,
+            "critic_loss": loss,
         }
 
         return training_state, metrics
@@ -589,7 +605,7 @@ if __name__ == "__main__":
     @jax.jit
     def sgd_step(carry, transitions):
         training_state, key = carry
-        key, critic_key, actor_key, = jax.random.split(key, 3)
+        key, critic_key, actor_key = jax.random.split(key, 3)
 
         training_state, actor_metrics = update_actor_and_alpha(transitions, training_state, actor_key)
 
@@ -609,8 +625,8 @@ if __name__ == "__main__":
         experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
 
         # update buffer
-        env_state, buffer_state = get_experience(
-            training_state.actor_state,
+        training_state, env_state, buffer_state = get_experience(
+            training_state,
             env_state,
             buffer_state,
             experience_key1,
@@ -667,12 +683,6 @@ if __name__ == "__main__":
         return training_state, env_state, buffer_state, metrics
 
 
-    key, prefill_key = jax.random.split(key, 2)
-
-    training_state, env_state, buffer_state, _ = prefill_replay_buffer(
-        training_state, env_state, buffer_state, prefill_key
-    )
-
     '''Setting up evaluator'''
     evaluator = CrlEvaluator(
         deterministic_actor_step,
@@ -680,6 +690,12 @@ if __name__ == "__main__":
         num_eval_envs=args.num_eval_envs,
         episode_length=args.episode_length,
         key=eval_env_key,
+    )
+
+    print('prefilling replay buffer....')
+    key, prefill_key = jax.random.split(key, 2)
+    training_state, env_state, buffer_state, _ = prefill_replay_buffer(
+        training_state, env_state, buffer_state, prefill_key
     )
 
     training_walltime = 0
@@ -691,7 +707,6 @@ if __name__ == "__main__":
         key, epoch_key = jax.random.split(key)
         training_state, env_state, buffer_state, metrics = training_epoch(training_state, env_state, buffer_state,
                                                                           epoch_key)
-
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
 
@@ -706,24 +721,14 @@ if __name__ == "__main__":
             **{f"training/{name}": value for name, value in metrics.items()},
         }
 
-        metrics, stats = evaluator.run_evaluation(training_state, metrics)
-        if args.track:
-            # plot trajectories
-            import matplotlib.pyplot as plt
-
-            fig = plot_trajectories(args.num_eval_vis, stats, use_planner=False)
-            wandb.log({"evaluation_trajectory": wandb.Image(fig)}, step=ne)
-            plt.close(fig)
+        metrics = evaluator.run_evaluation(training_state, metrics)
 
         print(metrics)
 
-        if args.checkpoint and ne % args.num_epochs_per_checkpoint == 0:
+        if args.checkpoint:
             # Save current policy and critic params.
             params = (
-                training_state.alpha_state.params,
-                training_state.actor_state.params,
-                training_state.critic_state.params,
-            )
+            training_state.alpha_state.params, training_state.actor_state.params, training_state.critic_state.params)
             path = f"{save_path}/step_{int(training_state.env_steps)}.pkl"
             save_params(path, params)
 
@@ -736,20 +741,6 @@ if __name__ == "__main__":
     if args.checkpoint:
         # Save current policy and critic params.
         params = (
-            training_state.alpha_state.params,
-            training_state.actor_state.params,
-            training_state.critic_state.params
-        )
+        training_state.alpha_state.params, training_state.actor_state.params, training_state.critic_state.params)
         path = f"{save_path}/final.pkl"
         save_params(path, params)
-
-        if args.checkpoint_final_rb:
-            path = f"{save_path}/final_rb.pkl"
-            save_params(path, buffer_state)
-
-    render(training_state.actor_state, env, save_path, args.exp_name,
-           wandb_track=args.track)
-
-# (50000000 - 1024 x 1000) / 50 x 1024 x 62 = 15        #number of actor steps per epoch (which is equal to the number of training steps)
-# 1024 x 999 / 256 = 4000                               #number of gradient steps per actor step 
-# 1024 x 62 / 4000 = 16                                 #ratio of env steps per gradient step

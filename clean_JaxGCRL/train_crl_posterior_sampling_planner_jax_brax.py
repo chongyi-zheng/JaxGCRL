@@ -427,6 +427,7 @@ def main(args):
 
 
     def planner_step(env_state, planning_state, key):
+        # TODO (chong: there seems to have a bug here
         # posterior sampling
         goals = env_state.obs[:, args.obs_dim:]
         states = env_state.obs[:, :args.obs_dim]

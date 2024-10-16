@@ -500,8 +500,8 @@ def main(args):
     )
 
     actor.apply = jax.jit(actor.apply)
-    sag_encoder.apply = jax.jit(sag_encoder.apply)
-    sf_encoder.apply = jax.jit(sf_encoder.apply)
+    sa_encoder.apply = jax.jit(sa_encoder.apply)
+    g_encoder.apply = jax.jit(g_encoder.apply)
 
     # Trainstate
     training_state = TrainingState(
@@ -628,12 +628,12 @@ def main(args):
         goal = jnp.zeros_like(state)
         goal = goal.at[args.goal_start_idx:args.goal_end_idx].set(g)
         dummy_action = jnp.zeros((action_size, ))
-        # s_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
-        #                           state, dummy_action)
-        # g_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
-        #                           goal, dummy_action)
-        # projected_g_repr = projection.apply(
-        #     training_state.historical_critic_params["projection"], g_repr)
+        s_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
+                                  state, dummy_action)
+        g_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
+                                  goal, dummy_action)
+        projected_g_repr = projection.apply(
+            training_state.historical_critic_params["projection"], g_repr)
         # w_repr = sa_encoder.apply(training_state.critic_state.params["sa_encoder"],
         #                           waypoint_obs, waypoint_action)
         # projected_w_repr = projection.apply(training_state.critic_state.params["projection"], w_repr)
@@ -641,19 +641,19 @@ def main(args):
         # compute representation distances
         # w_pdists = -energy_fn(w_repr, projected_w_repr)
         # w_pdists = jnp.where((w_pdists < args.max_edge_dist), w_pdists, jnp.inf)
-        # sw_dists = -energy_fn(s_repr[None, :], planning_state.projected_w_repr).squeeze()
-        # sw_dists = jnp.where(sw_dists < args.max_edge_dist, sw_dists, jnp.inf)
-        # wg_dists = -energy_fn(planning_state.w_repr, projected_g_repr[None, :]).squeeze()
-        # wg_dists = jnp.where(wg_dists < args.max_edge_dist, wg_dists, jnp.inf)
-        # sg_dist = -energy_fn(s_repr[None, :], projected_g_repr[None, :]).squeeze()
-
-        sw_dists = jnp.linalg.norm(state[:2][None] - planning_state.waypoint_obs[:, :2], axis=-1)
+        sw_dists = -energy_fn(s_repr[None, :], planning_state.projected_w_repr).squeeze()
         sw_dists = jnp.where(sw_dists <= args.max_edge_dist, sw_dists, jnp.inf)
-        sw_dists = jnp.where(sw_dists >= args.min_edge_dist, sw_dists, jnp.inf)
-        wg_dists = jnp.linalg.norm(planning_state.waypoint_obs[:, :2] - goal[:2][None], axis=-1)
+        wg_dists = -energy_fn(planning_state.w_repr, projected_g_repr[None, :]).squeeze()
         wg_dists = jnp.where(wg_dists <= args.max_edge_dist, wg_dists, jnp.inf)
-        wg_dists = jnp.where(wg_dists >= args.min_edge_dist, wg_dists, jnp.inf)
-        sg_dist = jnp.linalg.norm(state[:2] - goal[:2])
+        sg_dist = -energy_fn(s_repr[None, :], projected_g_repr[None, :]).squeeze()
+
+        # sw_dists = jnp.linalg.norm(state[:2][None] - planning_state.waypoint_obs[:, :2], axis=-1)
+        # sw_dists = jnp.where(sw_dists <= args.max_edge_dist, sw_dists, jnp.inf)
+        # sw_dists = jnp.where(sw_dists >= args.min_edge_dist, sw_dists, jnp.inf)
+        # wg_dists = jnp.linalg.norm(planning_state.waypoint_obs[:, :2] - goal[:2][None], axis=-1)
+        # wg_dists = jnp.where(wg_dists <= args.max_edge_dist, wg_dists, jnp.inf)
+        # wg_dists = jnp.where(wg_dists >= args.min_edge_dist, wg_dists, jnp.inf)
+        # sg_dist = jnp.linalg.norm(state[:2] - goal[:2])
 
         if args.open_loop:
             def update_ps(planning_state):
@@ -1031,14 +1031,15 @@ def main(args):
         projected_w_repr = projection.apply(training_state.historical_critic_params["projection"],
                                             w_repr)
 
-        # w_pdists = -energy_fn(w_repr[:, None], projected_w_repr[None, :])
-        # w_pdists = jnp.where((w_pdists < args.max_edge_dist), w_pdists, jnp.inf)
-
-        w_pdists = jnp.linalg.norm(waypoint_obs[:, :2][None] - waypoint_obs[:, :2][:, None], axis=-1)
+        w_pdists = -energy_fn(w_repr[:, None], projected_w_repr[None, :])
         w_pdists = jnp.where((w_pdists <= args.max_edge_dist), w_pdists, jnp.inf)
-        w_pdists = jnp.where((w_pdists >= args.min_edge_dist), w_pdists, jnp.inf)
+
+        # w_pdists = jnp.linalg.norm(waypoint_obs[:, :2][None] - waypoint_obs[:, :2][:, None], axis=-1)
+        # w_pdists = jnp.where((w_pdists <= args.max_edge_dist), w_pdists, jnp.inf)
+        # w_pdists = jnp.where((w_pdists >= args.min_edge_dist), w_pdists, jnp.inf)
 
         shortest_w_pdists, *_ = jax.vmap(bellman_ford, in_axes=(None, 0))(w_pdists, jnp.arange(w_repr.shape[0]))
+        shortest_w_pdists = jnp.fill_diagonal(shortest_w_pdists, jnp.inf, inplace=False)
         planning_state = planning_state.replace(
             waypoint_obs=waypoint_obs,
             w_repr=w_repr,
@@ -1155,7 +1156,7 @@ def main(args):
     '''Setting up evaluator'''
     evaluator = CrlPlanningEvaluator(
         deterministic_actor_step,
-        planner_step if args.eval_planner else lambda s, ps: s,
+        planner_step if args.eval_planner else lambda s, ps, k: s,
         env,
         num_eval_envs=args.num_eval_envs,
         episode_length=args.episode_length,

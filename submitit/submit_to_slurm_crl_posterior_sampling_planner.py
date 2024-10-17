@@ -24,7 +24,7 @@ def main():
     executor = submitit.AutoExecutor(folder="/tmp/submitit_logs")  # this path is not actually used.
     executor.update_parameters(
         slurm_name="crl_ps",
-        slurm_time=1.5 * 60,  # minute
+        slurm_time=int(1 * 60),  # minute
         slurm_partition=partition,
         slurm_nodes=1,
         slurm_ntasks_per_node=1,  # tasks can share nodes

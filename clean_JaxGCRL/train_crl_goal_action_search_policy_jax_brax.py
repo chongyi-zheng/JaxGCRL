@@ -564,7 +564,7 @@ def main(args):
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
     def energy_fn(x, y):
-        energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1))
+        energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1) + 1e-6)
 
         return energy
 
@@ -616,123 +616,157 @@ def main(args):
             extras={"state_extras": state_extras},
         )
 
-    def search_waypoint(training_state, env_state, planning_state):
-        # (shortest_path, shortest_dist, start_idx, w_counter,
-        #  init_waypoint_obs, init_w_repr, init_projected_w_repr,
-        #  init_sw_dists, init_wg_dists) = planning_state
+    # def search_waypoint(training_state, env_state, planning_state):
+    #     # (shortest_path, shortest_dist, start_idx, w_counter,
+    #     #  init_waypoint_obs, init_w_repr, init_projected_w_repr,
+    #     #  init_sw_dists, init_wg_dists) = planning_state
+    #
+    #     # compute representations
+    #     # waypoint_obs = waypoint_transitions.observation[:, :args.obs_dim]
+    #     # waypoint_action = waypoint_transitions.action
+    #     state, g = env_state.obs[:args.obs_dim], env_state.obs[args.obs_dim:]
+    #     goal = jnp.zeros_like(state)
+    #     goal = goal.at[args.goal_start_idx:args.goal_end_idx].set(g)
+    #     dummy_action = jnp.zeros((action_size, ))
+    #     s_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
+    #                               state, dummy_action)
+    #     g_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
+    #                               goal, dummy_action)
+    #     projected_g_repr = projection.apply(
+    #         training_state.historical_critic_params["projection"], g_repr)
+    #     # w_repr = sa_encoder.apply(training_state.critic_state.params["sa_encoder"],
+    #     #                           waypoint_obs, waypoint_action)
+    #     # projected_w_repr = projection.apply(training_state.critic_state.params["projection"], w_repr)
+    #
+    #     # compute representation distances
+    #     # w_pdists = -energy_fn(w_repr, projected_w_repr)
+    #     # w_pdists = jnp.where((w_pdists < args.max_edge_dist), w_pdists, jnp.inf)
+    #     sw_dists = -energy_fn(s_repr[None, :], planning_state.projected_w_repr).squeeze()
+    #     sw_dists = jnp.where(sw_dists <= args.max_edge_dist, sw_dists, jnp.inf)
+    #     wg_dists = -energy_fn(planning_state.w_repr, projected_g_repr[None, :]).squeeze()
+    #     wg_dists = jnp.where(wg_dists <= args.max_edge_dist, wg_dists, jnp.inf)
+    #     sg_dist = -energy_fn(s_repr[None, :], projected_g_repr[None, :]).squeeze()
+    #
+    #     # sw_dists = jnp.linalg.norm(state[:2][None] - planning_state.waypoint_obs[:, :2], axis=-1)
+    #     # sw_dists = jnp.where(sw_dists <= args.max_edge_dist, sw_dists, jnp.inf)
+    #     # sw_dists = jnp.where(sw_dists >= args.min_edge_dist, sw_dists, jnp.inf)
+    #     # wg_dists = jnp.linalg.norm(planning_state.waypoint_obs[:, :2] - goal[:2][None], axis=-1)
+    #     # wg_dists = jnp.where(wg_dists <= args.max_edge_dist, wg_dists, jnp.inf)
+    #     # wg_dists = jnp.where(wg_dists >= args.min_edge_dist, wg_dists, jnp.inf)
+    #     # sg_dist = jnp.linalg.norm(state[:2] - goal[:2])
+    #
+    #     if args.open_loop:
+    #         def update_ps(planning_state):
+    #             """compute shortest path"""
+    #             # construct adjacency matrix
+    #             adj = jnp.full((args.num_candidates + 2, args.num_candidates + 2), jnp.inf)
+    #             adj = jnp.fill_diagonal(adj, 0, inplace=False)
+    #             adj = adj.at[:args.num_candidates, :args.num_candidates].set(w_pdists)
+    #             adj = adj.at[args.num_candidates, :args.num_candidates].set(sw_dists)
+    #             adj = adj.at[:args.num_candidates, args.num_candidates + 1].set(wg_dists)
+    #             shortest_dists, predecessors, _ = bellman_ford(adj, args.num_candidates)
+    #             shortest_path, shortest_dists, start_idx = get_shortest_path(
+    #                 shortest_dists, predecessors, args.num_candidates, args.num_candidates + 1)
+    #             start_idx = start_idx + 1
+    #             w_counter = 0
+    #             planning_state = planning_state.replace(
+    #                 shortest_path=shortest_path,
+    #                 shortest_dists=shortest_dists,
+    #                 start_idx=start_idx,
+    #                 w_counter=w_counter,
+    #                 init_waypoint_obs=waypoint_obs,
+    #                 init_w_repr=w_repr,
+    #                 init_projected_w_repr=projected_w_repr,
+    #                 init_sw_dists=sw_dists,
+    #                 init_wg_dists=wg_dists,
+    #             )
+    #
+    #             return planning_state
+    #
+    #         planning_state = jax.lax.cond(
+    #             env_state.info['steps'] == 0,
+    #             update_ps,
+    #             lambda ps: ps,
+    #             planning_state,
+    #         )
+    #
+    #         w_idx = planning_state.shortest_path[planning_state.start_idx + planning_state.w_counter]
+    #         waypoint = planning_state.init_waypoint_obs[w_idx][args.goal_start_idx:args.goal_end_idx]
+    #         sw_dist = planning_state.init_sw_dists[w_idx]
+    #
+    #         def next_waypoint(planning_state):
+    #             w_counter = jax.lax.min(
+    #                 planning_state.w_counter + 1, args.num_candidates - planning_state.start_idx)
+    #             w_idx = planning_state.shortest_path[planning_state.start_idx + planning_state.w_counter]
+    #             waypoint = planning_state.init_waypoint_obs[w_idx][args.goal_start_idx:args.goal_end_idx]
+    #             sw_dist = planning_state.init_sw_dists[w_idx]
+    #
+    #             planning_state = planning_state.replace(w_counter=w_counter)
+    #
+    #             return planning_state, w_idx, waypoint, sw_dist
+    #
+    #         planning_state, w_idx, waypoint, sw_dist = jax.lax.cond(
+    #             sw_dist < args.max_edge_dist,
+    #             next_waypoint,
+    #             lambda ps: (ps, w_idx, waypoint, sw_dist),
+    #             planning_state
+    #         )
+    #         wg_dist = planning_state.init_sw_dists[w_idx]
+    #         sg_dist_via_w = sw_dist + wg_dist
+    #     else:
+    #         search_dists = sw_dists[:, None] + planning_state.shortest_w_pdists + wg_dists[None]
+    #         sg_dist_via_w = jnp.min(search_dists, axis=[0, 1])
+    #         w_idx = jnp.argmin(jnp.min(search_dists, axis=1), axis=0)
+    #         waypoint = planning_state.waypoint_obs[w_idx][args.goal_start_idx:args.goal_end_idx]
+    #
+    #     waypoint = jax.lax.select(
+    #         jnp.logical_or(sg_dist_via_w < sg_dist, sg_dist > args.max_edge_dist),
+    #         waypoint,
+    #         goal[args.goal_start_idx:args.goal_end_idx],
+    #     )
+    #
+    #     # planning_state = (shortest_path, shortest_dist, start_idx, w_counter,
+    #     #                   init_waypoint_obs, init_w_repr, init_projected_w_repr,
+    #     #                   init_sw_dists, init_wg_dists)
+    #
+    #     return waypoint, planning_state
 
-        # compute representations
-        # waypoint_obs = waypoint_transitions.observation[:, :args.obs_dim]
-        # waypoint_action = waypoint_transitions.action
-        state, g = env_state.obs[:args.obs_dim], env_state.obs[args.obs_dim:]
+    def search_waypoint(training_state, env_state, planning_state):
+        state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
         goal = jnp.zeros_like(state)
-        goal = goal.at[args.goal_start_idx:args.goal_end_idx].set(g)
-        dummy_action = jnp.zeros((action_size, ))
+        goal = goal.at[:, args.goal_start_idx:args.goal_end_idx].set(g)
+        dummy_action = jnp.zeros((state.shape[0], action_size))
         s_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
                                   state, dummy_action)
         g_repr = sa_encoder.apply(training_state.historical_critic_params["sa_encoder"],
                                   goal, dummy_action)
         projected_g_repr = projection.apply(
             training_state.historical_critic_params["projection"], g_repr)
-        # w_repr = sa_encoder.apply(training_state.critic_state.params["sa_encoder"],
-        #                           waypoint_obs, waypoint_action)
-        # projected_w_repr = projection.apply(training_state.critic_state.params["projection"], w_repr)
 
-        # compute representation distances
-        # w_pdists = -energy_fn(w_repr, projected_w_repr)
-        # w_pdists = jnp.where((w_pdists < args.max_edge_dist), w_pdists, jnp.inf)
-        sw_dists = -energy_fn(s_repr[None, :], planning_state.projected_w_repr).squeeze()
+        sw_dists = -energy_fn(s_repr[:, None], planning_state.projected_w_repr[None])  # (B, N)
+        wg_dists = -energy_fn(planning_state.w_repr[None], projected_g_repr[:, None])  # (B, N)
+        sg_dist = -energy_fn(s_repr, projected_g_repr)  # (B, )
+
         sw_dists = jnp.where(sw_dists <= args.max_edge_dist, sw_dists, jnp.inf)
-        wg_dists = -energy_fn(planning_state.w_repr, projected_g_repr[None, :]).squeeze()
         wg_dists = jnp.where(wg_dists <= args.max_edge_dist, wg_dists, jnp.inf)
-        sg_dist = -energy_fn(s_repr[None, :], projected_g_repr[None, :]).squeeze()
 
-        # sw_dists = jnp.linalg.norm(state[:2][None] - planning_state.waypoint_obs[:, :2], axis=-1)
-        # sw_dists = jnp.where(sw_dists <= args.max_edge_dist, sw_dists, jnp.inf)
-        # sw_dists = jnp.where(sw_dists >= args.min_edge_dist, sw_dists, jnp.inf)
-        # wg_dists = jnp.linalg.norm(planning_state.waypoint_obs[:, :2] - goal[:2][None], axis=-1)
-        # wg_dists = jnp.where(wg_dists <= args.max_edge_dist, wg_dists, jnp.inf)
-        # wg_dists = jnp.where(wg_dists >= args.min_edge_dist, wg_dists, jnp.inf)
-        # sg_dist = jnp.linalg.norm(state[:2] - goal[:2])
+        # (B, N, 1) + (1, N, N) + (B, 1, N) -> (B, N, N)
+        search_dists = sw_dists[:, :, None] + planning_state.shortest_w_pdists + wg_dists[:, None]
+        sg_dist_via_w = jnp.min(search_dists, axis=[1, 2])  # (B, )
+        w_idxs = jnp.argmin(jnp.min(search_dists, axis=2), axis=1)  # (B, )
 
-        if args.open_loop:
-            def update_ps(planning_state):
-                """compute shortest path"""
-                # construct adjacency matrix
-                adj = jnp.full((args.num_candidates + 2, args.num_candidates + 2), jnp.inf)
-                adj = jnp.fill_diagonal(adj, 0, inplace=False)
-                adj = adj.at[:args.num_candidates, :args.num_candidates].set(w_pdists)
-                adj = adj.at[args.num_candidates, :args.num_candidates].set(sw_dists)
-                adj = adj.at[:args.num_candidates, args.num_candidates + 1].set(wg_dists)
-                shortest_dists, predecessors, _ = bellman_ford(adj, args.num_candidates)
-                shortest_path, shortest_dists, start_idx = get_shortest_path(
-                    shortest_dists, predecessors, args.num_candidates, args.num_candidates + 1)
-                start_idx = start_idx + 1
-                w_counter = 0
-                planning_state = planning_state.replace(
-                    shortest_path=shortest_path,
-                    shortest_dists=shortest_dists,
-                    start_idx=start_idx,
-                    w_counter=w_counter,
-                    init_waypoint_obs=waypoint_obs,
-                    init_w_repr=w_repr,
-                    init_projected_w_repr=projected_w_repr,
-                    init_sw_dists=sw_dists,
-                    init_wg_dists=wg_dists,
-                )
+        waypoint = planning_state.waypoint_obs[w_idxs][:, args.goal_start_idx:args.goal_end_idx]
 
-                return planning_state
-
-            planning_state = jax.lax.cond(
-                env_state.info['steps'] == 0,
-                update_ps,
-                lambda ps: ps,
-                planning_state,
-            )
-
-            w_idx = planning_state.shortest_path[planning_state.start_idx + planning_state.w_counter]
-            waypoint = planning_state.init_waypoint_obs[w_idx][args.goal_start_idx:args.goal_end_idx]
-            sw_dist = planning_state.init_sw_dists[w_idx]
-
-            def next_waypoint(planning_state):
-                w_counter = jax.lax.min(
-                    planning_state.w_counter + 1, args.num_candidates - planning_state.start_idx)
-                w_idx = planning_state.shortest_path[planning_state.start_idx + planning_state.w_counter]
-                waypoint = planning_state.init_waypoint_obs[w_idx][args.goal_start_idx:args.goal_end_idx]
-                sw_dist = planning_state.init_sw_dists[w_idx]
-
-                planning_state = planning_state.replace(w_counter=w_counter)
-
-                return planning_state, w_idx, waypoint, sw_dist
-
-            planning_state, w_idx, waypoint, sw_dist = jax.lax.cond(
-                sw_dist < args.max_edge_dist,
-                next_waypoint,
-                lambda ps: (ps, w_idx, waypoint, sw_dist),
-                planning_state
-            )
-            wg_dist = planning_state.init_sw_dists[w_idx]
-            sg_dist_via_w = sw_dist + wg_dist
-        else:
-            search_dists = sw_dists[:, None] + planning_state.shortest_w_pdists + wg_dists[None]
-            sg_dist_via_w = jnp.min(search_dists, axis=[0, 1])
-            w_idx = jnp.argmin(jnp.min(search_dists, axis=1), axis=0)
-            waypoint = planning_state.waypoint_obs[w_idx][args.goal_start_idx:args.goal_end_idx]
-
-        waypoint = jax.lax.select(
-            jnp.logical_or(sg_dist_via_w < sg_dist, sg_dist > args.max_edge_dist),
+        waypoint = jnp.where(
+            jnp.logical_or(sg_dist_via_w < sg_dist, sg_dist > args.max_edge_dist)[:, None],
             waypoint,
-            goal[args.goal_start_idx:args.goal_end_idx],
+            g,
         )
-
-        # planning_state = (shortest_path, shortest_dist, start_idx, w_counter,
-        #                   init_waypoint_obs, init_w_repr, init_projected_w_repr,
-        #                   init_sw_dists, init_wg_dists)
 
         return waypoint, planning_state
 
     def planner_step(env_state, planning_state, key):
-        waypoint, planning_state = jax.vmap(search_waypoint, in_axes=(None, 0, None))(
+        waypoint, planning_state = search_waypoint(
             training_state, env_state, planning_state)
         env_state_with_waypoint = env_state.replace(
             obs=jnp.concatenate([env_state.obs[:, :args.obs_dim], waypoint], axis=-1))

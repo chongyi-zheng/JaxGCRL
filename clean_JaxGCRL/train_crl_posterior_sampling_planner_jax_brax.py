@@ -392,6 +392,10 @@ def main(args):
     )
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
+    def energy_fn(x, y):
+        energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1) + 1e-6)
+
+        return energy
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
@@ -440,11 +444,11 @@ def main(args):
 
         s_repr = s_encoder.apply(s_encoder_params, states)
         w_repr = g_encoder.apply(g_encoder_params, w_candidates[:, args.goal_start_idx:args.goal_end_idx])
-        sw_logits = -jnp.sqrt(jnp.sum((s_repr[:, None] - w_repr[None, :]) ** 2, axis=-1))  # (B, N)
+        sw_logits = energy_fn(s_repr[:, None], w_repr[None, :])  # (B, N)
 
         w_repr = s_encoder.apply(s_encoder_params, w_candidates)
         g_repr = g_encoder.apply(g_encoder_params, goals)
-        wg_logits = -jnp.sqrt(jnp.sum((w_repr[:, None] - g_repr[None, :]) ** 2, axis=-1))  # (N, B)
+        wg_logits = energy_fn(w_repr[:, None], g_repr[None, :])  # (N, B)
 
         # resampling importance sampling
         log_scores = sw_logits + wg_logits.transpose(1, 0)  # (B, N)
@@ -541,8 +545,7 @@ def main(args):
         def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
             obs = transitions.observation  # expected_shape = batch_size, obs_size + goal_size
             state = obs[:, :args.obs_dim]
-            future_state = transitions.extras["future_state"]
-            goal = future_state[:, args.goal_start_idx: args.goal_end_idx]
+            goal = transitions.extras["future_goal"]
             observation = jnp.concatenate([state, goal], axis=1)
 
             means, log_stds = actor.apply(actor_params, observation)
@@ -557,7 +560,7 @@ def main(args):
             sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             g_repr = g_encoder.apply(g_encoder_params, goal)
 
-            qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+            qf_pi = energy_fn(sa_repr, g_repr)
 
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
 
@@ -598,7 +601,7 @@ def main(args):
             )
 
             obs = transitions.observation[:, :args.obs_dim]
-            future_goal = transitions.extras["future_state"][:, args.goal_start_idx: args.goal_end_idx]
+            future_goal = transitions.extras["future_goal"]
             future_state = transitions.extras["future_state"]
             action = transitions.action
 
@@ -609,8 +612,8 @@ def main(args):
 
             # InfoNCE
             I = jnp.eye(obs.shape[0])
-            sag_logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
-            ssf_logits = -jnp.sqrt(jnp.sum((s_repr[:, None, :] - sf_repr[None, :, :]) ** 2, axis=-1))
+            sag_logits = energy_fn(sa_repr[:, None, :], g_repr[None, :, :])
+            ssf_logits = energy_fn(s_repr[:, None, :], sf_repr[None, :, :])
             sag_critic_loss = jnp.mean(optax.softmax_cross_entropy(sag_logits, I))
             ssf_critic_loss = jnp.mean(optax.softmax_cross_entropy(ssf_logits, I))
             critic_loss = sag_critic_loss + ssf_critic_loss
@@ -789,7 +792,6 @@ def main(args):
             # plot trajectories
             import matplotlib.pyplot as plt
             fig = plot_trajectories(args.num_eval_vis, stats, use_planner=args.eval_planner)
-            # fig.savefig("/home/cz8792/research/JaxGCRL/debug_figs/traj.pdf")
             wandb.log({"evaluation_trajectory": wandb.Image(fig)}, step=ne)
             plt.close(fig)
 

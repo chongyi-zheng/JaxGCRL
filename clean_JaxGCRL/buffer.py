@@ -205,10 +205,9 @@ class TrajectoryUniformSamplingQueue():
         future_obs = jnp.take(transition.observation, goal_index[:-1], axis=0) #the last goal_index cannot be considered as there is no future.
         future_action = jnp.take(transition.action, goal_index[:-1], axis=0)
         future_state = future_obs[:, :obs_dim]
-        commanded_state = jnp.zeros_like(future_state)
-        commanded_state = commanded_state.at[:, goal_start_idx:goal_end_idx].set(
-            transition.observation[:-1, obs_dim:])
-        state = transition.observation[:-1, :obs_dim] #all states are considered
+        future_goal = future_obs[:, goal_start_idx:goal_end_idx]
+        commanded_goal = transition.observation[:-1, obs_dim:]
+        state = transition.observation[:-1, : obs_dim]
         next_state = transition.observation[1:, :obs_dim]
         goal = future_state[:, goal_start_idx:goal_end_idx]
         new_obs = jnp.concatenate([state, goal], axis=1)
@@ -221,8 +220,8 @@ class TrajectoryUniformSamplingQueue():
             },
             "state": state,
             "next_state": next_state,
-            "commanded_state": commanded_state,
-            "commanded_goal": transition.observation[:-1, obs_dim:],
+            "commanded_goal": commanded_goal,
+            "future_goal": future_goal,
             "future_state": future_state,
             "future_action": future_action,
         }

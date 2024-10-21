@@ -65,6 +65,7 @@ class Args:
     gamma: float = 0.99
     repr_dim: int = 64
     resubs: bool = True
+    quasimetric_energy_type: str = 'none'
     logsumexp_penalty_coeff: float = 0.1
 
     max_replay_size: int = 10000
@@ -394,7 +395,19 @@ def main(args):
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
     def energy_fn(x, y):
-        energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1))
+        if args.quasimetric_energy_type == 'mrn':
+            x_sym, x_asym = jnp.split(x, 2, axis=-1)
+            y_sym, y_asym = jnp.split(y, 2, axis=-1)
+
+            d_sym = jnp.sqrt(jnp.sum((x_sym - y_sym) ** 2 + 1e-6, axis=-1))
+            d_asym = jnp.max(jax.nn.relu(x_asym - y_asym), axis=-1)
+
+            dist = d_sym + d_asym
+            energy = -dist
+        elif args.quasimetric_energy_type == 'iqe':
+            raise NotImplemented
+        elif args.quasimetric_energy_type == 'none':
+            energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1))
 
         return energy
 
@@ -441,7 +454,6 @@ def main(args):
 
 
     def planner_step(env_state, planning_state, key):
-        # TODO (chong: there seems to have a bug here
         # posterior sampling
         g = env_state.obs[:, args.obs_dim:]
         states = env_state.obs[:, :args.obs_dim]

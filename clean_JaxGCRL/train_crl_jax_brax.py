@@ -64,6 +64,7 @@ class Args:
     gamma: float = 0.99
     repr_dim: int = 64
     resubs: bool = True
+    quasimetric_energy_type: str = 'none'
     logsumexp_penalty_coeff: float = 0.1
 
     max_replay_size: int = 10000
@@ -299,7 +300,7 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
     key, buffer_key, env_key, eval_env_key, actor_key, sa_key, g_key = jax.random.split(key, 7)
 
-    # Environment setup    
+    # Environment setup
     if args.env_id == "ant":
         from clean_JaxGCRL.envs.ant import Ant
 
@@ -351,11 +352,15 @@ if __name__ == "__main__":
     )
 
     # Critic
-    sa_encoder = SA_encoder(repr_dim=args.repr_dim)
+    if args.quasimetric_energy_type == 'mrn':
+        sa_encoder = SA_encoder(repr_dim=2 * args.repr_dim)
+        g_encoder = G_encoder(repr_dim=2 * args.repr_dim)
+    else:
+        sa_encoder = SA_encoder(repr_dim=args.repr_dim)
+        g_encoder = G_encoder(repr_dim=args.repr_dim)
+
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    g_encoder = G_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
-    # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
         params={"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params},
@@ -416,9 +421,22 @@ if __name__ == "__main__":
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
     def energy_fn(x, y):
-        energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1))
+        if args.quasimetric_energy_type == 'mrn':
+            x_sym, x_asym = jnp.split(x, 2, axis=-1)
+            y_sym, y_asym = jnp.split(y, 2, axis=-1)
+
+            d_sym = jnp.sqrt(jnp.sum((x_sym - y_sym) ** 2 + 1e-6, axis=-1))
+            d_asym = jnp.max(jax.nn.relu(x_asym - y_asym), axis=-1)
+
+            dist = d_sym + d_asym
+            energy = -dist
+        elif args.quasimetric_energy_type == 'iqe':
+            raise NotImplemented
+        elif args.quasimetric_energy_type == 'none':
+            energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1))
 
         return energy
+
     def log_softmax(logits, axis, resubs):
         if not resubs:
             I = jnp.eye(logits.shape[0])

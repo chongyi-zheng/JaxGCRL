@@ -63,6 +63,7 @@ class Args:
     batch_size: int = 256
     gamma: float = 0.99
     repr_dim: int = 64
+    resubs: bool = True
     logsumexp_penalty_coeff: float = 0.1
 
     max_replay_size: int = 10000
@@ -414,6 +415,18 @@ if __name__ == "__main__":
     )
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
+    def energy_fn(x, y):
+        energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1))
+
+        return energy
+    def log_softmax(logits, axis, resubs):
+        if not resubs:
+            I = jnp.eye(logits.shape[0])
+            big = 100
+            eps = 1e-6
+            return logits, -jax.nn.logsumexp(logits - big * I + eps, axis=axis, keepdims=True)
+        else:
+            return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
@@ -490,8 +503,8 @@ if __name__ == "__main__":
         def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
             obs = transitions.observation  # expected_shape = batch_size, obs_size + goal_size
             state = obs[:, :args.obs_dim]
-            future_state = transitions.extras["future_state"]
-            goal = future_state[:, args.goal_start_idx: args.goal_end_idx]
+            # future_state = transitions.extras["future_state"]
+            goal = transitions.extras["future_goal"]
             observation = jnp.concatenate([state, goal], axis=1)
 
             means, log_stds = actor.apply(actor_params, observation)
@@ -506,7 +519,8 @@ if __name__ == "__main__":
             sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             g_repr = g_encoder.apply(g_encoder_params, goal)
 
-            qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+            qf_pi = energy_fn(sa_repr, g_repr)
+            # qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
 
@@ -549,8 +563,11 @@ if __name__ == "__main__":
             g_repr = g_encoder.apply(g_encoder_params, transitions.observation[:, args.obs_dim:])
 
             # InfoNCE
-            logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
-            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+            logits = energy_fn(sa_repr[:, None, :], g_repr[None, :, :])
+            # logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
+            # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+            pos_loss, neg_loss = log_softmax(logits, axis=1, resubs=args.resubs)
+            critic_loss = -jnp.mean(jnp.diag(pos_loss + neg_loss))
 
             # logsumexp regularisation
             logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)

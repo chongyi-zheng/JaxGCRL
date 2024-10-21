@@ -513,18 +513,29 @@ if __name__ == "__main__":
             sf_repr = sf_encoder.apply(sf_encoder_params, random_future_state)
             logits = -jnp.sqrt(jnp.sum((sag_repr[:, None, :] - sf_repr[None, :, :]) ** 2, axis=-1))
 
-            I = jnp.eye(observation.shape[0])
-            q_loss = optax.softmax_cross_entropy(logits=logits, labels=I)
+            def log_softmax(logits, axis, resubs):
+                if not resubs:
+                    I = jnp.eye(logits.shape[0])
+                    big = 100
+                    eps = 1e-6
+                    return logits, -jax.nn.logsumexp(logits - big * I + eps, axis=axis, keepdims=True)
+                else:
+                    return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
+
+            # I = jnp.eye(observation.shape[0])
+            # q_loss = optax.softmax_cross_entropy(logits=logits, labels=I)
+            align_loss, unif_loss = log_softmax(logits, axis=-1, resubs=False)
+            q_loss = -jnp.mean(jnp.diag(align_loss + unif_loss))
 
             # TODO (chongyiz): do we need the entropy regularization?
-            actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob + q_loss)
+            loss = jnp.mean(jnp.exp(log_alpha) * log_prob + q_loss)
 
-            return actor_loss, (jnp.mean(q_loss), log_prob)
+            return loss, (jnp.mean(q_loss), jnp.mean(log_prob))
 
         def alpha_loss(alpha_params, log_prob):
             alpha = jnp.exp(alpha_params["log_alpha"])
-            alpha_loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - target_entropy))
-            return jnp.mean(alpha_loss)
+            loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - target_entropy))
+            return jnp.mean(loss)
 
         (actor_loss, (actor_q_loss, log_prob)), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
             training_state.actor_state.params, training_state.critic_state.params,

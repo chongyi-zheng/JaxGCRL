@@ -24,7 +24,7 @@ def main():
     executor = submitit.AutoExecutor(folder="/tmp/submitit_logs")  # this path is not actually used.
     executor.update_parameters(
         slurm_name="crl",
-        slurm_time=3 * 60,  # minute
+        slurm_time=1 * 60,  # minute
         slurm_partition=partition,
         slurm_nodes=1,
         slurm_ntasks_per_node=1,  # tasks can share nodes
@@ -36,10 +36,10 @@ def main():
     )
 
     with executor.batch():  # job array
-        for env_id in ["ant_u_maze"]:
-            for total_env_steps in [100_000_000]:
+        for env_id in ["ant_randomized_init_u_maze"]:
+            for total_env_steps in [10_000_000]:
                 for seed in [0]:
-                    exp_name = f"ant_u_maze_forward_infonce_logsumexp_reg"
+                    exp_name = f"ant_randomized_init_u_maze_forward_infonce_logsumexp_reg_no_resubs"
                     log_dir = os.path.expanduser(
                         f"{log_root_dir}/exp_logs/jax_gcrl_logs/crl/{exp_name}/{seed}")
 
@@ -70,6 +70,7 @@ def main():
                         mkdir -p {log_dir};
                         python $PROJECT_DIR/clean_JaxGCRL/train_crl_jax_brax.py \
                             --track \
+                            --no-resubs \
                             --seed={seed} \
                             --env_id={env_id} \
                             --batch_size=1024 \

@@ -37,7 +37,7 @@ def main():
 
     with executor.batch():  # job array
         for env_id in ["ant_u_maze"]:
-            for total_env_steps in [100_000_000]:
+            for total_env_steps in [10_000_000]:
                 for seed in [0]:
                     exp_name = f"ant_u_maze_forward_infonce_logsumexp_reg"
                     log_dir = os.path.expanduser(

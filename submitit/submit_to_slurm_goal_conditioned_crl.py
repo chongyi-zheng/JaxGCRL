@@ -38,8 +38,8 @@ def main():
     with executor.batch():  # job array
         for env_id in ["ant_u_maze"]:
             for total_env_steps in [100_000_000]:
-                for seed in [0]:
-                    exp_name = f"ant_u_maze_forward_infonce_logsumexp_reg"
+                for seed in [1]:
+                    exp_name = f"ant_u_maze_forward_infonce_logsumexp_reg_sf_for_actor"
                     log_dir = os.path.expanduser(
                         f"{log_root_dir}/exp_logs/jax_gcrl_logs/goal_conditioned_crl/{exp_name}/{seed}")
 

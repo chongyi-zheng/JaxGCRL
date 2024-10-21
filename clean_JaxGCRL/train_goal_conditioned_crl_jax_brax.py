@@ -153,6 +153,7 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+    # def __call__(self, s, g_repr):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
@@ -161,6 +162,7 @@ class Actor(nn.Module):
         lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
 
+        # x = jnp.concatenate([s, g_repr], axis=-1)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)
@@ -345,7 +347,8 @@ if __name__ == "__main__":
     actor = Actor(action_size=action_size)
     actor_state = TrainState.create(
         apply_fn=actor.apply,
-        params=actor.init(actor_key, np.ones([1, obs_size])),
+        params=actor.init(actor_key, np.ones([1, args.obs_dim]), np.ones([1, args.repr_dim])),
+        # params=actor.init(actor_key, np.ones([1, obs_size])),
         tx=optax.adam(learning_rate=args.actor_lr)
     )
 
@@ -422,7 +425,16 @@ if __name__ == "__main__":
 
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
-        means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
+        """Function to collect data during evaluation. Used in evaluator.py"""
+
+        obs = env_state.obs
+        state = obs[:, :args.obs_dim]
+        commanded_goal = obs[:, args.obs_dim:]
+
+        commanded_g_repr = sf_encoder.apply(training_state.critic_state.params["sf_encoder"], commanded_goal)
+
+        means, _ = actor_state.apply_fn(training_state.actor_state.params, state, commanded_g_repr)
+        # means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
         actions = nn.tanh(means)
 
         nstate = env.step(env_state, actions)
@@ -437,15 +449,21 @@ if __name__ == "__main__":
         )
 
 
-    def actor_step(actor_state, env, env_state, key, extra_fields):
-        means, log_stds = actor.apply(actor_state.params, env_state.obs)
+    def actor_step(training_state, env, env_state, key, extra_fields):
+        obs = env_state.obs
+        state = obs[:, :args.obs_dim]
+        commanded_goal = obs[:, args.obs_dim:]
+        commanded_g_repr = sf_encoder.apply(training_state.critic_state.params["sf_encoder"], commanded_goal)
+
+        means, log_stds = actor.apply(training_state.actor_state.params, state, commanded_g_repr)
+        # means, log_stds = actor.apply(actor_state.params, env_state.obs)
         stds = jnp.exp(log_stds)
         actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
 
         nstate = env.step(env_state, actions)
         state_extras = {x: nstate.info[x] for x in extra_fields}
 
-        return nstate, Transition(
+        return training_state, nstate, Transition(
             observation=env_state.obs,
             action=actions,
             reward=nstate.reward,
@@ -455,19 +473,20 @@ if __name__ == "__main__":
 
 
     @jax.jit
-    def get_experience(actor_state, env_state, buffer_state, key):
+    def get_experience(training_state, env_state, buffer_state, key):
         @jax.jit
         def f(carry, unused_t):
-            env_state, current_key = carry
+            training_state, env_state, current_key = carry
             current_key, next_key = jax.random.split(current_key)
-            env_state, transition = actor_step(actor_state, env, env_state, current_key,
-                                               extra_fields=("truncation", "seed"))
-            return (env_state, next_key), transition
+            training_state, env_state, transition = actor_step(training_state, env, env_state, current_key,
+                                                               extra_fields=("seed",))
+            return (training_state, env_state, next_key), transition
 
-        (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=args.unroll_length)
+        (training_state, env_state, _), data = jax.lax.scan(f, (training_state, env_state, key), (),
+                                                            length=args.unroll_length)
 
         buffer_state = replay_buffer.insert(buffer_state, data)
-        return env_state, buffer_state
+        return training_state, env_state, buffer_state
 
 
     def prefill_replay_buffer(training_state, env_state, buffer_state, key):
@@ -476,11 +495,12 @@ if __name__ == "__main__":
             del unused
             training_state, env_state, buffer_state, key = carry
             key, new_key = jax.random.split(key)
-            env_state, buffer_state = get_experience(
-                training_state.actor_state,
+            training_state, env_state, buffer_state = get_experience(
+                training_state,
                 env_state,
                 buffer_state,
                 key,
+
             )
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + args.env_steps_per_actor_step,
@@ -494,12 +514,16 @@ if __name__ == "__main__":
     @jax.jit
     def update_actor_and_alpha(transitions, training_state, key):
         def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
+            sag_encoder_params, sf_encoder_params = critic_params["sag_encoder"], critic_params["sf_encoder"]
+
             obs = transitions.observation  # expected_shape = batch_size, obs_size + goal_size
             state = obs[:, :args.obs_dim]
-            future_goal = transitions.extras["future_state"][:, args.goal_start_idx: args.goal_end_idx]
-            observation = jnp.concatenate([state, future_goal], axis=1)
+            future_goal = transitions.extras["future_goal"]
+            # observation = jnp.concatenate([state, future_goal], axis=1)
 
-            means, log_stds = actor.apply(actor_params, observation)
+            sf_repr = sf_encoder.apply(sf_encoder_params, future_goal)
+            means, log_stds = actor.apply(actor_params, state, sf_repr)
+            # means, log_stds = actor.apply(actor_params, observation)
             stds = jnp.exp(log_stds)
             x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
             action = nn.tanh(x_ts)
@@ -507,7 +531,6 @@ if __name__ == "__main__":
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sag_encoder_params, sf_encoder_params = critic_params["sag_encoder"], critic_params["sf_encoder"]
             sag_repr = sag_encoder.apply(sag_encoder_params, state, action, future_goal)
             g_repr = sf_encoder.apply(sf_encoder_params, future_goal)
 
@@ -547,12 +570,12 @@ if __name__ == "__main__":
         def critic_loss(critic_params, transitions, key):
             sag_encoder_params, sf_encoder_params = critic_params["sag_encoder"], critic_params["sf_encoder"]
 
-            obs = transitions.observation[:, :args.obs_dim]
+            state = transitions.observation[:, :args.obs_dim]
             action = transitions.action
-            commanded_goal = transitions.extras["commanded_state"][:, args.goal_start_idx: args.goal_end_idx]
-            future_goal = transitions.extras["future_state"][:, args.goal_start_idx: args.goal_end_idx]
+            commanded_goal = transitions.extras["commanded_goal"]
+            future_goal = transitions.extras["future_goal"]
 
-            sag_repr = sag_encoder.apply(sag_encoder_params, obs, action, commanded_goal)
+            sag_repr = sag_encoder.apply(sag_encoder_params, state, action, commanded_goal)
             sf_repr = sf_encoder.apply(sf_encoder_params, future_goal)
 
             # InfoNCE
@@ -570,7 +593,7 @@ if __name__ == "__main__":
 
             return critic_loss, (logsumexp, correct, logits_pos, logits_neg)
 
-        (critic_l, (logsumexp, I, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(critic_loss, has_aux=True)(
+        (critic_l, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(critic_loss, has_aux=True)(
             training_state.critic_state.params, transitions, key)
         new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
         training_state = training_state.replace(critic_state=new_critic_state)
@@ -589,7 +612,7 @@ if __name__ == "__main__":
     @jax.jit
     def sgd_step(carry, transitions):
         training_state, key = carry
-        key, critic_key, actor_key, = jax.random.split(key, 3)
+        key, critic_key, actor_key = jax.random.split(key, 3)
 
         training_state, actor_metrics = update_actor_and_alpha(transitions, training_state, actor_key)
 
@@ -609,8 +632,8 @@ if __name__ == "__main__":
         experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
 
         # update buffer
-        env_state, buffer_state = get_experience(
-            training_state.actor_state,
+        training_state, env_state, buffer_state = get_experience(
+            training_state,
             env_state,
             buffer_state,
             experience_key1,
@@ -667,12 +690,6 @@ if __name__ == "__main__":
         return training_state, env_state, buffer_state, metrics
 
 
-    key, prefill_key = jax.random.split(key, 2)
-
-    training_state, env_state, buffer_state, _ = prefill_replay_buffer(
-        training_state, env_state, buffer_state, prefill_key
-    )
-
     '''Setting up evaluator'''
     evaluator = CrlEvaluator(
         deterministic_actor_step,
@@ -680,6 +697,12 @@ if __name__ == "__main__":
         num_eval_envs=args.num_eval_envs,
         episode_length=args.episode_length,
         key=eval_env_key,
+    )
+
+    print('prefilling replay buffer....')
+    key, prefill_key = jax.random.split(key, 2)
+    training_state, env_state, buffer_state, _ = prefill_replay_buffer(
+        training_state, env_state, buffer_state, prefill_key
     )
 
     training_walltime = 0
@@ -691,7 +714,6 @@ if __name__ == "__main__":
         key, epoch_key = jax.random.split(key)
         training_state, env_state, buffer_state, metrics = training_epoch(training_state, env_state, buffer_state,
                                                                           epoch_key)
-
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
 
@@ -738,7 +760,7 @@ if __name__ == "__main__":
         params = (
             training_state.alpha_state.params,
             training_state.actor_state.params,
-            training_state.critic_state.params
+            training_state.critic_state.params,
         )
         path = f"{save_path}/final.pkl"
         save_params(path, params)

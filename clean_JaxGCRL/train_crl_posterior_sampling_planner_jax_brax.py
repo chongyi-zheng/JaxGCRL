@@ -64,6 +64,7 @@ class Args:
     batch_size: int = 256
     gamma: float = 0.99
     repr_dim: int = 64
+    resubs: bool = True
     logsumexp_penalty_coeff: float = 0.1
 
     max_replay_size: int = 10000
@@ -393,9 +394,18 @@ def main(args):
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
     def energy_fn(x, y):
-        energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1) + 1e-6)
+        energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1))
 
         return energy
+
+    def log_softmax(logits, axis, resubs):
+        if not resubs:
+            I = jnp.eye(logits.shape[0])
+            big = 100
+            eps = 1e-6
+            return logits, -jax.nn.logsumexp(logits - big * I + eps, axis=axis, keepdims=True)
+        else:
+            return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
@@ -433,7 +443,7 @@ def main(args):
     def planner_step(env_state, planning_state, key):
         # TODO (chong: there seems to have a bug here
         # posterior sampling
-        goals = env_state.obs[:, args.obs_dim:]
+        g = env_state.obs[:, args.obs_dim:]
         states = env_state.obs[:, :args.obs_dim]
         w_candidates = planning_state.candidate_obs  # (N, obs_dim)
 
@@ -443,11 +453,15 @@ def main(args):
         )
 
         s_repr = s_encoder.apply(s_encoder_params, states)
+        # w_repr = s_encoder.apply(s_encoder_params, w_candidates)
         w_repr = g_encoder.apply(g_encoder_params, w_candidates[:, args.goal_start_idx:args.goal_end_idx])
         sw_logits = energy_fn(s_repr[:, None], w_repr[None, :])  # (B, N)
 
         w_repr = s_encoder.apply(s_encoder_params, w_candidates)
-        g_repr = g_encoder.apply(g_encoder_params, goals)
+        g_repr = g_encoder.apply(g_encoder_params, g)
+        # goals = jnp.zeros_like(states)
+        # goals = goals.at[:, args.goal_start_idx: args.goal_end_idx].set(g)
+        # g_repr = s_encoder.apply(s_encoder_params, goals)
         wg_logits = energy_fn(w_repr[:, None], g_repr[None, :])  # (N, B)
 
         # resampling importance sampling
@@ -608,21 +622,26 @@ def main(args):
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
             g_repr = g_encoder.apply(g_encoder_params, future_goal)
             s_repr = s_encoder.apply(s_encoder_params, obs)
-            sf_repr = s_encoder.apply(s_encoder_params, future_state)
+            # sf_repr = s_encoder.apply(s_encoder_params, future_state)
 
             # InfoNCE
             I = jnp.eye(obs.shape[0])
             sag_logits = energy_fn(sa_repr[:, None, :], g_repr[None, :, :])
-            ssf_logits = energy_fn(s_repr[:, None, :], sf_repr[None, :, :])
-            sag_critic_loss = jnp.mean(optax.softmax_cross_entropy(sag_logits, I))
-            ssf_critic_loss = jnp.mean(optax.softmax_cross_entropy(ssf_logits, I))
+            ssf_logits = energy_fn(s_repr[:, None, :], g_repr[None, :, :])
+            # ssf_logits = energy_fn(s_repr[:, None, :], sf_repr[None, :, :])
+            # sag_critic_loss = jnp.mean(optax.softmax_cross_entropy(sag_logits, I))
+            sag_align_loss, sag_unif_loss = log_softmax(sag_logits, axis=1, resubs=args.resubs)
+            sag_critic_loss = -jnp.mean(jnp.diag(sag_align_loss + sag_unif_loss))
+            # ssf_critic_loss = jnp.mean(optax.softmax_cross_entropy(ssf_logits, I))
+            ssf_align_loss, ssf_unif_loss = log_softmax(ssf_logits, axis=1, resubs=args.resubs)
+            ssf_critic_loss = -jnp.mean(jnp.diag(ssf_align_loss + ssf_unif_loss))
             critic_loss = sag_critic_loss + ssf_critic_loss
 
             # logsumexp regularisation
             sag_logsumexp = jax.nn.logsumexp(sag_logits + 1e-6, axis=1)
-            # sg_logsumexp = jax.nn.logsumexp(sg_logits + 1e-6, axis=1)
+            ssf_logsumexp = jax.nn.logsumexp(ssf_logits + 1e-6, axis=1)
             critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sag_logsumexp ** 2)
-            # critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sg_logsumexp ** 2)
+            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(ssf_logsumexp ** 2)
 
             sag_correct = jnp.argmax(sag_logits, axis=1) == jnp.argmax(I, axis=1)
             sag_logits_pos = jnp.sum(sag_logits * I) / jnp.sum(I)

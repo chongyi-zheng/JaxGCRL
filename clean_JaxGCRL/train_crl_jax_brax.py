@@ -65,6 +65,7 @@ class Args:
     repr_dim: int = 64
     resubs: bool = True
     quasimetric_energy_type: str = 'none'
+    quasimetric_num_groups: int = 8
     logsumexp_penalty_coeff: float = 0.1
 
     max_replay_size: int = 10000
@@ -361,9 +362,10 @@ if __name__ == "__main__":
 
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
+    iqe_coef = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
-        params={"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params},
+        params={"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params, "iqe_coef": iqe_coef},
         tx=optax.adam(learning_rate=args.critic_lr),
     )
 
@@ -420,7 +422,7 @@ if __name__ == "__main__":
     )
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
-    def energy_fn(x, y):
+    def energy_fn(x, y, iqe_coef):
         if args.quasimetric_energy_type == 'mrn':
             x_sym, x_asym = jnp.split(x, 2, axis=-1)
             y_sym, y_asym = jnp.split(y, 2, axis=-1)
@@ -431,7 +433,34 @@ if __name__ == "__main__":
             dist = d_sym + d_asym
             energy = -dist
         elif args.quasimetric_energy_type == 'iqe':
-            raise NotImplemented
+            # (chongyiz): this code is pretty slow.
+            iqe_coef = jax.nn.sigmoid(iqe_coef)
+
+            reshape = (
+                args.quasimetric_num_groups,
+                args.repr_dim // args.quasimetric_num_groups,
+            )
+            x = jnp.reshape(x, (*x.shape[:-1], *reshape))
+            y = jnp.reshape(y, (*y.shape[:-1], *reshape))
+            valid = x < y
+            D = x.shape[-1]
+            xy = jnp.concatenate(jnp.broadcast_arrays(x, y), axis=-1)
+            ixy = xy.argsort(axis=-1)
+            # sxy = jnp.take_along_axis(xy, ixy, axis=-1)
+            sxy = xy.sort(axis=-1)
+            neg_inc_copies = jnp.take_along_axis(valid, ixy % D, axis=-1) * jnp.where(
+                ixy < D, -1, 1
+            )
+            neg_inp_copies = jnp.cumsum(neg_inc_copies, axis=-1)
+            neg_f = (neg_inp_copies < 0) * (-1.0)
+            neg_incf = jnp.concatenate(
+                [neg_f[..., :1], neg_f[..., 1:] - neg_f[..., :-1]], axis=-1
+            )
+            components = (sxy * neg_incf).sum(-1)
+            dist = iqe_coef * components.mean(axis=-1) + (1 - iqe_coef) * components.max(
+                axis=-1
+            )
+            energy = -dist
         elif args.quasimetric_energy_type == 'none':
             energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1))
 
@@ -533,11 +562,15 @@ if __name__ == "__main__":
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
+            sa_encoder_params, g_encoder_params, iqe_coef = (
+                critic_params["sa_encoder"],
+                critic_params["g_encoder"],
+                critic_params["iqe_coef"],
+            )
             sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             g_repr = g_encoder.apply(g_encoder_params, goal)
 
-            qf_pi = energy_fn(sa_repr, g_repr)
+            qf_pi = energy_fn(sa_repr, g_repr, iqe_coef)
             # qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
@@ -572,7 +605,11 @@ if __name__ == "__main__":
     @jax.jit
     def update_critic(transitions, training_state, key):
         def critic_loss(critic_params, transitions, key):
-            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
+            sa_encoder_params, g_encoder_params, iqe_coef = (
+                critic_params["sa_encoder"],
+                critic_params["g_encoder"],
+                critic_params["iqe_coef"],
+            )
 
             obs = transitions.observation[:, :args.obs_dim]
             action = transitions.action
@@ -581,11 +618,11 @@ if __name__ == "__main__":
             g_repr = g_encoder.apply(g_encoder_params, transitions.observation[:, args.obs_dim:])
 
             # InfoNCE
-            logits = energy_fn(sa_repr[:, None, :], g_repr[None, :, :])
+            logits = energy_fn(sa_repr[:, None, :], g_repr[None, :, :], iqe_coef)
             # logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = BxB
             # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
-            pos_loss, neg_loss = log_softmax(logits, axis=1, resubs=args.resubs)
-            critic_loss = -jnp.mean(jnp.diag(pos_loss + neg_loss))
+            align_loss, unif_loss = log_softmax(logits, axis=1, resubs=args.resubs)
+            critic_loss = -jnp.mean(jnp.diag(align_loss + unif_loss))
 
             # logsumexp regularisation
             logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)

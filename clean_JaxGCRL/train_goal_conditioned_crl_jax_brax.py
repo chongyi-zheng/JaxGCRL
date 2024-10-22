@@ -152,8 +152,8 @@ class Actor(nn.Module):
     log_std_min: int = -5
 
     @nn.compact
-    def __call__(self, x):
-    # def __call__(self, s, g_repr):
+    # def __call__(self, x):
+    def __call__(self, s, g_repr):
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
         else:
@@ -162,7 +162,7 @@ class Actor(nn.Module):
         lecun_uniform = variance_scaling(1 / 3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
 
-        # x = jnp.concatenate([s, g_repr], axis=-1)
+        x = jnp.concatenate([s, g_repr], axis=-1)
         x = nn.Dense(1024, kernel_init=lecun_uniform, bias_init=bias_init)(x)
         x = normalize(x)
         x = nn.swish(x)

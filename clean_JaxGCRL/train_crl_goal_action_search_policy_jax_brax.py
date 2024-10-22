@@ -66,6 +66,8 @@ class Args:
     batch_size: int = 256
     gamma: float = 0.99
     repr_dim: int = 64
+    resubs: bool = True
+    quasimetric_energy_type: str = 'none'
     logsumexp_penalty_coeff: float = 0.1
 
     max_replay_size: int = 10000
@@ -474,12 +476,20 @@ def main(args):
     )
 
     # Critic
-    sa_encoder = SA_encoder(repr_dim=args.repr_dim)
+    if args.quasimetric_energy_type == 'mrn':
+        sa_encoder = SA_encoder(repr_dim=2 * args.repr_dim)
+        g_encoder = G_encoder(repr_dim=2 * args.repr_dim)
+        projection = Projection(repr_dim=2 * args.repr_dim)
+    else:
+        sa_encoder = SA_encoder(repr_dim=args.repr_dim)
+        g_encoder = G_encoder(repr_dim=args.repr_dim)
+        projection = Projection(repr_dim=args.repr_dim)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    g_encoder = G_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]))
-    projection = Projection(repr_dim=args.repr_dim)
-    proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
+    if args.quasimetric_energy_type == 'mrn':
+        proj_params = projection.init(rot_key, np.ones([1, 2 * args.repr_dim]))
+    else:
+        proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
     # proj_params = projection.init(rot_key, np.ones([1, args.repr_dim]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
@@ -514,21 +524,29 @@ def main(args):
     )
 
     # Planning State
-    planning_state = PlanningState(
-        # shortest_path=jnp.zeros((args.num_envs, args.num_candidates + 2), dtype=jnp.int32),
-        # shortest_dists=jnp.zeros((args.num_envs, args.num_candidates + 2), dtype=jnp.float32),
-        # start_idx=jnp.zeros((args.num_envs, ), dtype=jnp.int32),
-        # w_counter=jnp.zeros((args.num_envs, ), dtype=jnp.int32),
-        # init_waypoint_obs=jnp.zeros((args.num_envs, args.num_candidates, args.obs_dim), dtype=jnp.float32),
-        # init_w_repr=jnp.zeros((args.num_envs, args.num_candidates, args.repr_dim), dtype=jnp.float32),
-        # init_projected_w_repr=jnp.zeros((args.num_envs, args.num_candidates, args.repr_dim), dtype=jnp.float32),
-        # init_sw_dists=jnp.zeros((args.num_envs, args.num_candidates), dtype=jnp.float32),
-        # init_wg_dists=jnp.zeros((args.num_envs, args.num_candidates), dtype=jnp.float32),
-        waypoint_obs=jnp.zeros((args.num_candidates, args.obs_dim), dtype=jnp.float32),
-        w_repr=jnp.zeros((args.num_candidates, args.repr_dim), dtype=jnp.float32),
-        projected_w_repr=jnp.zeros((args.num_candidates, args.repr_dim), dtype=jnp.float32),
-        shortest_w_pdists=jnp.zeros((args.num_candidates, args.num_candidates), dtype=jnp.float32),
-    )
+    if args.quasimetric_energy_type == 'mrn':
+        planning_state = PlanningState(
+            waypoint_obs=jnp.zeros((args.num_candidates, args.obs_dim), dtype=jnp.float32),
+            w_repr=jnp.zeros((args.num_candidates, 2 * args.repr_dim), dtype=jnp.float32),
+            projected_w_repr=jnp.zeros((args.num_candidates, 2 * args.repr_dim), dtype=jnp.float32),
+            shortest_w_pdists=jnp.zeros((args.num_candidates, args.num_candidates), dtype=jnp.float32),
+        )
+    else:
+        planning_state = PlanningState(
+            # shortest_path=jnp.zeros((args.num_envs, args.num_candidates + 2), dtype=jnp.int32),
+            # shortest_dists=jnp.zeros((args.num_envs, args.num_candidates + 2), dtype=jnp.float32),
+            # start_idx=jnp.zeros((args.num_envs, ), dtype=jnp.int32),
+            # w_counter=jnp.zeros((args.num_envs, ), dtype=jnp.int32),
+            # init_waypoint_obs=jnp.zeros((args.num_envs, args.num_candidates, args.obs_dim), dtype=jnp.float32),
+            # init_w_repr=jnp.zeros((args.num_envs, args.num_candidates, args.repr_dim), dtype=jnp.float32),
+            # init_projected_w_repr=jnp.zeros((args.num_envs, args.num_candidates, args.repr_dim), dtype=jnp.float32),
+            # init_sw_dists=jnp.zeros((args.num_envs, args.num_candidates), dtype=jnp.float32),
+            # init_wg_dists=jnp.zeros((args.num_envs, args.num_candidates), dtype=jnp.float32),
+            waypoint_obs=jnp.zeros((args.num_candidates, args.obs_dim), dtype=jnp.float32),
+            w_repr=jnp.zeros((args.num_candidates, args.repr_dim), dtype=jnp.float32),
+            projected_w_repr=jnp.zeros((args.num_candidates, args.repr_dim), dtype=jnp.float32),
+            shortest_w_pdists=jnp.zeros((args.num_candidates, args.num_candidates), dtype=jnp.float32),
+        )
 
     # Replay Buffer
     dummy_obs = jnp.zeros((obs_size,))
@@ -564,9 +582,30 @@ def main(args):
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
     def energy_fn(x, y):
-        energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1) + 1e-6)
+        if args.quasimetric_energy_type == 'mrn':
+            x_sym, x_asym = jnp.split(x, 2, axis=-1)
+            y_sym, y_asym = jnp.split(y, 2, axis=-1)
+
+            d_sym = jnp.sqrt(jnp.sum((x_sym - y_sym) ** 2 + 1e-6, axis=-1))
+            d_asym = jnp.max(jax.nn.relu(x_asym - y_asym), axis=-1)
+
+            dist = d_sym + d_asym
+            energy = -dist
+        elif args.quasimetric_energy_type == 'iqe':
+            raise NotImplemented
+        elif args.quasimetric_energy_type == 'none':
+            energy = -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1))
 
         return energy
+
+    def log_softmax(logits, axis, resubs):
+        if not resubs:
+            I = jnp.eye(logits.shape[0])
+            big = 100
+            eps = 1e-6
+            return logits, -jax.nn.logsumexp(logits - big * I + eps, axis=axis, keepdims=True)
+        else:
+            return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         # state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
@@ -1015,7 +1054,9 @@ def main(args):
             # logits_no_resubs = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - rand_g_repr[None, :, :]) ** 2, axis=-1))
             # logits_no_resubs = jnp.fill_diagonal(logits, -jnp.inf, inplace=False)
             # forward infonce
-            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+            # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+            align_loss, unif_loss = log_softmax(logits, axis=1, resubs=args.resubs)
+            critic_loss = -jnp.mean(jnp.diag(align_loss + unif_loss))
             # backward infonce
             # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=0))
             # forward infonce without diagonal terms

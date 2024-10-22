@@ -317,16 +317,23 @@ def main(args):
     actor = Actor(action_size=action_size)
     actor_state = TrainState.create(
         apply_fn=actor.apply,
+        # params=actor.init(actor_key, np.ones([1, 2 * args.repr_dim])),
         params=actor.init(actor_key, np.ones([1, obs_size])),
         tx=optax.adam(learning_rate=args.actor_lr)
     )
 
     # Critic
-    sa_encoder = SA_encoder(repr_dim=args.repr_dim)
+    if args.quasimetric_energy_type == 'mrn':
+        sa_encoder = SA_encoder(repr_dim=2 * args.repr_dim)
+        s_encoder = S_encoder(repr_dim=2 * args.repr_dim)
+        g_encoder = S_encoder(repr_dim=2 * args.repr_dim)
+    else:
+        sa_encoder = SA_encoder(repr_dim=args.repr_dim)
+        s_encoder = S_encoder(repr_dim=args.repr_dim)
+        g_encoder = S_encoder(repr_dim=args.repr_dim)
+
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    s_encoder = S_encoder(repr_dim=args.repr_dim)
     s_encoder_params = s_encoder.init(s_key, np.ones([1, args.obs_dim]))
-    g_encoder = S_encoder(repr_dim=args.repr_dim)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
@@ -421,6 +428,15 @@ def main(args):
             return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
+        # obs = env_state.obs
+        # state = obs[:, :args.obs_dim]
+        # goal = obs[:, args.obs_dim:]
+        #
+        # s_repr = s_encoder.apply(training_state.critic_state.params["s_encoder"], state)
+        # g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+        # sg_repr = jnp.concatenate([s_repr, g_repr], axis=-1)
+        #
+        # means, _ = actor.apply(training_state.actor_state.params, sg_repr)
         means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
         actions = nn.tanh(means)
 
@@ -437,6 +453,15 @@ def main(args):
 
 
     def actor_step(training_state, env, env_state, key, extra_fields):
+        # obs = env_state.obs
+        # state = obs[:, :args.obs_dim]
+        # goal = obs[:, args.obs_dim:]
+        #
+        # s_repr = s_encoder.apply(training_state.critic_state.params["s_encoder"], state)
+        # g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goal)
+        # sg_repr = jnp.concatenate([s_repr, g_repr], axis=-1)
+        #
+        # means, log_stds = actor.apply(training_state.actor_state.params, sg_repr)
         means, log_stds = actor.apply(training_state.actor_state.params, env_state.obs)
         stds = jnp.exp(log_stds)
         actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
@@ -569,11 +594,22 @@ def main(args):
     @jax.jit
     def update_actor_and_alpha(transitions, training_state, key):
         def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
+            sa_encoder_params, s_encoder_params, g_encoder_params = (
+                critic_params["sa_encoder"],
+                critic_params["s_encoder"],
+                critic_params["g_encoder"]
+            )
+
             obs = transitions.observation  # expected_shape = batch_size, obs_size + goal_size
             state = obs[:, :args.obs_dim]
             goal = transitions.extras["future_goal"]
             observation = jnp.concatenate([state, goal], axis=1)
-
+            #
+            # s_repr = s_encoder.apply(s_encoder_params, state)
+            # g_repr = g_encoder.apply(g_encoder_params, goal)
+            # sg_repr = jnp.concatenate([s_repr, g_repr], axis=-1)
+            #
+            # means, log_stds = actor.apply(actor_params, sg_repr)
             means, log_stds = actor.apply(actor_params, observation)
             stds = jnp.exp(log_stds)
             x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
@@ -582,7 +618,6 @@ def main(args):
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
             sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             g_repr = g_encoder.apply(g_encoder_params, goal)
 
@@ -673,7 +708,7 @@ def main(args):
             "sag_critic_loss": sag_critic_loss,
             "ssf_critic_loss": ssf_critic_loss,
             "sag_logsumexp": sag_logsumexp,
-            "sag_correct": sag_correct,
+            "sag_categorical_accuracy": sag_correct.mean(),
             "sag_logits_pos": sag_logits_pos,
             "sag_logits_neg": sag_logits_neg,
         }
@@ -858,10 +893,18 @@ def main(args):
             path = f"{save_path}/final_rb.pkl"
             save_params(path, buffer_state)
 
-    def render(actor_state, env, exp_dir, exp_name, deterministic=True,
+    def render(training_state, env, exp_dir, exp_name, deterministic=True,
                wandb_track=False):
         def actor_sample(observations, key, deterministic=deterministic):
-            means, log_stds = actor.apply(actor_state.params, observations)
+            # states = observations[..., :args.obs_dim]
+            # goals = observations[..., args.obs_dim:]
+            #
+            # s_repr = s_encoder.apply(training_state.critic_state.params["s_encoder"], states)
+            # g_repr = g_encoder.apply(training_state.critic_state.params["g_encoder"], goals)
+            # sg_repr = jnp.concatenate([s_repr, g_repr], axis=-1)
+            #
+            # means, log_stds = actor.apply(training_state.actor_state.params, sg_repr)
+            means, log_stds = actor.apply(training_state.actor_state.params, observations)
             if deterministic:
                 actions = nn.tanh(means)
             else:
@@ -895,7 +938,7 @@ def main(args):
         if wandb_track:
             wandb.log({"render": wandb.Html(url)})
 
-    render(training_state.actor_state, env, save_path, args.exp_name,
+    render(training_state, env, save_path, args.exp_name,
            wandb_track=args.track)
 
 if __name__ == "__main__":

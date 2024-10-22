@@ -65,6 +65,7 @@ class Args:
     gamma: float = 0.99
     repr_dim: int = 64
     resubs: bool = True
+    log1msoftmax: bool = False
     quasimetric_energy_type: str = 'none'
     logsumexp_penalty_coeff: float = 0.1
 
@@ -427,6 +428,10 @@ def main(args):
         else:
             return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
+    def log1m_softmax(x, axis):
+        s = jax.nn.logsumexp(x, axis=axis)
+        return jnp.log1p(-jnp.exp(x - s))
+
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         # obs = env_state.obs
         # state = obs[:, :args.obs_dim]
@@ -683,6 +688,12 @@ def main(args):
             ssf_align_loss, ssf_unif_loss = log_softmax(ssf_logits, axis=1, resubs=args.resubs)
             ssf_critic_loss = -jnp.mean(jnp.diag(ssf_align_loss + ssf_unif_loss))
             critic_loss = sag_critic_loss + ssf_critic_loss
+
+            I = jnp.eye(ssf_logits.shape[0])
+            if args.log1msoftmax:
+                sag_log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(sag_logits, axis=-1))
+                ssf_log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(ssf_logits, axis=-1))
+                critic_loss += (sag_log1msoftmax_loss + ssf_log1msoftmax_loss)
 
             # logsumexp regularisation
             sag_logsumexp = jax.nn.logsumexp(sag_logits + 1e-6, axis=1)

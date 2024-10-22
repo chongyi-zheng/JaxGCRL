@@ -67,6 +67,7 @@ class Args:
     gamma: float = 0.99
     repr_dim: int = 64
     resubs: bool = True
+    log1msoftmax: bool = False
     quasimetric_energy_type: str = 'none'
     logsumexp_penalty_coeff: float = 0.1
 
@@ -607,6 +608,10 @@ def main(args):
         else:
             return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
+    def log1m_softmax(x, axis):
+        s = jax.nn.logsumexp(x, axis=axis)
+        return jnp.log1p(-jnp.exp(x - s))
+
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         # state, g = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
         # goal = jnp.zeros_like(state)
@@ -1057,9 +1062,15 @@ def main(args):
             # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
             align_loss, unif_loss = log_softmax(logits, axis=1, resubs=args.resubs)
             critic_loss = -jnp.mean(jnp.diag(align_loss + unif_loss))
+
+            I = jnp.eye(logits.shape[0])
+            if args.log1msoftmax:
+                log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(logits, axis=-1))
+                critic_loss += log1msoftmax_loss
+
             # backward infonce
             # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=0))
-            # forward infonce without diagonal terms
+            # forward infonce without diagonal termsz
             # critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits_no_resubs, axis=0))
             # symmetric infonce without diagonal terms
             # I = jnp.eye(logits.shape[0])
@@ -1071,7 +1082,6 @@ def main(args):
             logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
             critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
 
-            I = jnp.eye(logits.shape[0])
             correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
             logits_pos = jnp.sum(logits * I) / jnp.sum(I)
             logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)

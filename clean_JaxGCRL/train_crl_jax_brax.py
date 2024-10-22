@@ -64,6 +64,7 @@ class Args:
     gamma: float = 0.99
     repr_dim: int = 64
     resubs: bool = True
+    log1msoftmax: bool = False
     quasimetric_energy_type: str = 'none'
     quasimetric_num_groups: int = 8
     logsumexp_penalty_coeff: float = 0.1
@@ -475,6 +476,10 @@ if __name__ == "__main__":
         else:
             return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
+    def log1m_softmax(x, axis):
+        s = jax.nn.logsumexp(x, axis=axis)
+        return jnp.log1p(-jnp.exp(x - s))
+
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
         actions = nn.tanh(means)
@@ -624,11 +629,15 @@ if __name__ == "__main__":
             align_loss, unif_loss = log_softmax(logits, axis=1, resubs=args.resubs)
             critic_loss = -jnp.mean(jnp.diag(align_loss + unif_loss))
 
+            I = jnp.eye(logits.shape[0])
+            if args.log1msoftmax:
+                log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(logits, axis=-1))
+                critic_loss += log1msoftmax_loss
+
             # logsumexp regularisation
             logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
             critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
 
-            I = jnp.eye(logits.shape[0])
             correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
             logits_pos = jnp.sum(logits * I) / jnp.sum(I)
             logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)

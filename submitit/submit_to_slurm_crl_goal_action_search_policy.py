@@ -13,7 +13,7 @@ def main():
         partition = 'gpu'
     elif cluster_name == 'della':
         log_root_dir = '/home/cz8792/gpfs'
-        partition = 'gpu-short'
+        partition = 'gpu-test'
     elif cluster_name in ['soak.cs.princeton.edu', 'wash.cs.princeton.edu',
                           'rinse.cs.princeton.edu', 'spin.cs.princeton.edu']:
         log_root_dir = '/n/fs/rl-chongyiz'

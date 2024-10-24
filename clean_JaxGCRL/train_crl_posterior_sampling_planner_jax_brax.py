@@ -422,9 +422,9 @@ def main(args):
     def log_softmax(logits, axis, resubs):
         if not resubs:
             I = jnp.eye(logits.shape[0])
-            big = 100
+            # big = 100
             eps = 1e-6
-            return logits, -jax.nn.logsumexp(logits - big * I + eps, axis=axis, keepdims=True)
+            return logits, -jax.nn.logsumexp(logits + eps, b=(1 - I), axis=axis, keepdims=True)
         else:
             return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
@@ -696,8 +696,8 @@ def main(args):
                 critic_loss += (sag_log1msoftmax_loss + ssf_log1msoftmax_loss)
 
             # logsumexp regularisation
-            sag_logsumexp = jax.nn.logsumexp(sag_logits + 1e-6, axis=1)
-            ssf_logsumexp = jax.nn.logsumexp(ssf_logits + 1e-6, axis=1)
+            sag_logsumexp = jax.nn.logsumexp(sag_logits + 1e-6, b=(1 - I), axis=1)
+            ssf_logsumexp = jax.nn.logsumexp(ssf_logits + 1e-6, b=(1 - I), axis=1)
             critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sag_logsumexp ** 2)
             critic_loss += args.logsumexp_penalty_coeff * jnp.mean(ssf_logsumexp ** 2)
 

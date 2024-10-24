@@ -64,6 +64,7 @@ class Args:
     gamma: float = 0.99
     repr_dim: int = 64
     resubs: bool = True
+    sym_infonce: bool = False
     log1msoftmax: bool = False
     quasimetric_energy_type: str = 'none'
     quasimetric_num_groups: int = 8
@@ -428,7 +429,7 @@ if __name__ == "__main__":
             x_sym, x_asym = jnp.split(x, 2, axis=-1)
             y_sym, y_asym = jnp.split(y, 2, axis=-1)
 
-            d_sym = jnp.sqrt(jnp.sum((x_sym - y_sym) ** 2 + 1e-6, axis=-1))
+            d_sym = jnp.sqrt(jnp.sum((x_sym - y_sym) ** 2, axis=-1) + 1e-6)
             d_asym = jnp.max(jax.nn.relu(x_asym - y_asym), axis=-1)
 
             dist = d_sym + d_asym
@@ -470,9 +471,9 @@ if __name__ == "__main__":
     def log_softmax(logits, axis, resubs):
         if not resubs:
             I = jnp.eye(logits.shape[0])
-            big = 100
+            # big = 100
             eps = 1e-6
-            return logits, -jax.nn.logsumexp(logits - big * I + eps, axis=axis, keepdims=True)
+            return logits, -jax.nn.logsumexp(logits + eps, b=(1 - I), axis=axis, keepdims=True)
         else:
             return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
@@ -634,9 +635,13 @@ if __name__ == "__main__":
                 log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(logits, axis=-1))
                 critic_loss += log1msoftmax_loss
 
-            # logsumexp regularisation
-            logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
+            logsumexp = jax.nn.logsumexp(logits + 1e-6, b=(1 - I), axis=1)
+            if args.sym_infonce:
+                align_loss2, unif_loss2 = log_softmax(logits, axis=0, resubs=args.resubs)
+                critic_loss += -jnp.mean(jnp.diag(align_loss2 + unif_loss2))
+            else:
+                # logsumexp regularisation
+                critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
 
             correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
             logits_pos = jnp.sum(logits * I) / jnp.sum(I)

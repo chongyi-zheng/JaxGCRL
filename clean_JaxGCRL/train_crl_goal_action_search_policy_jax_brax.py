@@ -587,7 +587,7 @@ def main(args):
             x_sym, x_asym = jnp.split(x, 2, axis=-1)
             y_sym, y_asym = jnp.split(y, 2, axis=-1)
 
-            d_sym = jnp.sqrt(jnp.sum((x_sym - y_sym) ** 2 + 1e-6, axis=-1))
+            d_sym = jnp.sqrt(jnp.sum((x_sym - y_sym) ** 2, axis=-1) + 1e-6)
             d_asym = jnp.max(jax.nn.relu(x_asym - y_asym), axis=-1)
 
             dist = d_sym + d_asym
@@ -602,9 +602,9 @@ def main(args):
     def log_softmax(logits, axis, resubs):
         if not resubs:
             I = jnp.eye(logits.shape[0])
-            big = 100
+            # big = 100
             eps = 1e-6
-            return logits, -jax.nn.logsumexp(logits - big * I + eps, axis=axis, keepdims=True)
+            return logits, -jax.nn.logsumexp(logits + eps, b=(1 - I), axis=axis, keepdims=True)
         else:
             return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
@@ -1079,7 +1079,7 @@ def main(args):
             # critic_loss += -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits - big * I, axis=0))
 
             # logsumexp regularisation
-            logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
+            logsumexp = jax.nn.logsumexp(logits + 1e-6, b=(1 - I), axis=1)
             critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
 
             correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)

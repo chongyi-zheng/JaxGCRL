@@ -24,7 +24,7 @@ def main():
     executor = submitit.AutoExecutor(folder="/tmp/submitit_logs")  # this path is not actually used.
     executor.update_parameters(
         slurm_name="crl_ps",
-        slurm_time=int(1.5 * 60),  # minute
+        slurm_time=int(1.0 * 60),  # minute
         slurm_partition=partition,
         slurm_nodes=1,
         slurm_ntasks_per_node=1,  # tasks can share nodes
@@ -41,8 +41,8 @@ def main():
                 for eval_planner in ["no-eval_planner"]:
                     for resubs in ["no-resubs"]:
                         for log1msoftmax in ["log1msoftmax"]:
-                            for quasimetric_energy_type in ["mrn"]:
-                                for repr_dim in [256]:
+                            for quasimetric_energy_type in ["none"]:
+                                for repr_dim in [32, 64, 128]:
                                     for total_env_steps in [10_000_000]:
                                         for seed in [0]:
                                             exp_name = f"crl_posterior_sampling_planner={train_planner}_{eval_planner}_forward_infonce_{resubs}_quasimetric={quasimetric_energy_type}_repr_dim={repr_dim}_{log1msoftmax}"

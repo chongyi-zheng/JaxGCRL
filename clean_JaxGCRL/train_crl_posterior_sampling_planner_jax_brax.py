@@ -65,6 +65,7 @@ class Args:
     gamma: float = 0.99
     repr_dim: int = 64
     resubs: bool = True
+    sym_infonce: bool = False
     log1msoftmax: bool = False
     quasimetric_energy_type: str = 'none'
     logsumexp_penalty_coeff: float = 0.1
@@ -428,9 +429,14 @@ def main(args):
         else:
             return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
-    def log1m_softmax(x, axis):
-        s = jax.nn.logsumexp(x, axis=axis)
-        return jnp.log1p(-jnp.exp(x - s))
+    def log1m_softmax(logits, axis, resubs):
+        if not resubs:
+            I = jnp.eye(logits.shape[0])
+            eps = 1e-6
+            s = jax.nn.logsumexp(logits + eps, b=(1 - I), axis=axis)
+        else:
+            s = jax.nn.logsumexp(logits, axis=axis)
+        return jnp.log1p(-jnp.exp(logits - s))
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         # obs = env_state.obs
@@ -677,7 +683,7 @@ def main(args):
             # sf_repr = s_encoder.apply(s_encoder_params, future_state)
 
             # InfoNCE
-            I = jnp.eye(obs.shape[0])
+            # I = jnp.eye(obs.shape[0])
             sag_logits = energy_fn(sa_repr[:, None, :], g_repr[None, :, :])
             ssf_logits = energy_fn(s_repr[:, None, :], g_repr[None, :, :])
             # ssf_logits = energy_fn(s_repr[:, None, :], sf_repr[None, :, :])
@@ -691,15 +697,27 @@ def main(args):
 
             I = jnp.eye(ssf_logits.shape[0])
             if args.log1msoftmax:
-                sag_log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(sag_logits, axis=-1))
-                ssf_log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(ssf_logits, axis=-1))
+                sag_log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(sag_logits, axis=1, resubs=args.resubs))
+                ssf_log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(ssf_logits, axis=1, resubs=args.resubs))
                 critic_loss += (sag_log1msoftmax_loss + ssf_log1msoftmax_loss)
 
             # logsumexp regularisation
             sag_logsumexp = jax.nn.logsumexp(sag_logits + 1e-6, b=(1 - I), axis=1)
             ssf_logsumexp = jax.nn.logsumexp(ssf_logits + 1e-6, b=(1 - I), axis=1)
-            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sag_logsumexp ** 2)
-            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(ssf_logsumexp ** 2)
+            if args.sym_infonce:
+                sag_align_loss2, sag_unif_loss2 = log_softmax(sag_logits, axis=0, resubs=args.resubs)
+                sag_critic_loss2 = -jnp.mean(jnp.diag(sag_align_loss2 + sag_unif_loss2))
+                ssf_align_loss2, ssf_unif_loss2 = log_softmax(ssf_logits, axis=0, resubs=args.resubs)
+                ssf_critic_loss2 = -jnp.mean(jnp.diag(ssf_align_loss2 + ssf_unif_loss2))
+                critic_loss = sag_critic_loss2 + ssf_critic_loss2
+
+                if args.log1msoftmax:
+                    sag_log1msoftmax_loss2 = -jnp.mean((1 - I) * log1m_softmax(sag_logits, axis=0, resubs=args.resubs))
+                    ssf_log1msoftmax_loss2 = -jnp.mean((1 - I) * log1m_softmax(ssf_logits, axis=0, resubs=args.resubs))
+                    critic_loss += (sag_log1msoftmax_loss2 + ssf_log1msoftmax_loss2)
+            else:
+                critic_loss += args.logsumexp_penalty_coeff * jnp.mean(sag_logsumexp ** 2)
+                critic_loss += args.logsumexp_penalty_coeff * jnp.mean(ssf_logsumexp ** 2)
 
             sag_correct = jnp.argmax(sag_logits, axis=1) == jnp.argmax(I, axis=1)
             sag_logits_pos = jnp.sum(sag_logits * I) / jnp.sum(I)

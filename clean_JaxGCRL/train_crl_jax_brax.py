@@ -477,9 +477,14 @@ if __name__ == "__main__":
         else:
             return logits, -jax.nn.logsumexp(logits, axis=axis, keepdims=True)
 
-    def log1m_softmax(x, axis):
-        s = jax.nn.logsumexp(x, axis=axis)
-        return jnp.log1p(-jnp.exp(x - s))
+    def log1m_softmax(logits, axis, resubs):
+        if not resubs:
+            I = jnp.eye(logits.shape[0])
+            eps = 1e-6
+            s = jax.nn.logsumexp(logits + eps, b=(1 - I), axis=axis)
+        else:
+            s = jax.nn.logsumexp(logits, axis=axis)
+        return jnp.log1p(-jnp.exp(logits - s))
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
         means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
@@ -632,13 +637,17 @@ if __name__ == "__main__":
 
             I = jnp.eye(logits.shape[0])
             if args.log1msoftmax:
-                log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(logits, axis=-1))
+                log1msoftmax_loss = -jnp.mean((1 - I) * log1m_softmax(logits, axis=1, resubs=args.resubs))
                 critic_loss += log1msoftmax_loss
 
             logsumexp = jax.nn.logsumexp(logits + 1e-6, b=(1 - I), axis=1)
             if args.sym_infonce:
                 align_loss2, unif_loss2 = log_softmax(logits, axis=0, resubs=args.resubs)
                 critic_loss += -jnp.mean(jnp.diag(align_loss2 + unif_loss2))
+
+                if args.log1msoftmax:
+                    log1msoftmax_loss2 = -jnp.mean((1 - I) * log1m_softmax(logits, axis=0, resubs=args.resubs))
+                    critic_loss += log1msoftmax_loss2
             else:
                 # logsumexp regularisation
                 critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)

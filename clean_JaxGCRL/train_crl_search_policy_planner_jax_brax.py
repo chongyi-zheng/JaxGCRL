@@ -77,7 +77,7 @@ class Args:
 
     unroll_length: int = 62
     """max distance of edges on the planning graph"""
-    max_edge_dist: float = 4.0
+    max_edge_dist: float = 3.0
     """min distance of edges on the planning graph"""
     min_edge_dist: float = 0.0
     """open-loop or close-loop planning"""

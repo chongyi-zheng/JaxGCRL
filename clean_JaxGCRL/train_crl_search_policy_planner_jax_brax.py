@@ -77,7 +77,7 @@ class Args:
 
     unroll_length: int = 62
     """max distance of edges on the planning graph"""
-    max_edge_dist: float = 3.0
+    max_edge_dist: float = 4.0
     """min distance of edges on the planning graph"""
     min_edge_dist: float = 0.0
     """open-loop or close-loop planning"""
@@ -88,6 +88,8 @@ class Args:
     train_planner: bool = False
     """whether to use planner during evaluation"""
     eval_planner: bool = False
+    """whether to use distance in the representation space for the planner"""
+    planner_use_repr: bool = False
 
     # to be filled in runtime
     env_steps_per_actor_step: int = 0
@@ -294,7 +296,7 @@ def main(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, buffer_key, env_key, eval_env_key, actor_key, sa_key, s_key, g_key = jax.random.split(key, 8)
+    key, buffer_key, env_key, eval_env_key, actor_key, sa_key, gga_key, s_key, g_key = jax.random.split(key, 9)
 
     # Environment setup    
     if args.env_id == "ant":
@@ -351,20 +353,24 @@ def main(args):
     # Critic
     if args.quasimetric_energy_type == 'mrn':
         sa_encoder = SA_encoder(repr_dim=2 * args.repr_dim)
+        gga_encoder = S_encoder(repr_dim=2 * args.repr_dim)
         s_encoder = S_encoder(repr_dim=2 * args.repr_dim)
         g_encoder = S_encoder(repr_dim=2 * args.repr_dim)
     else:
         sa_encoder = SA_encoder(repr_dim=args.repr_dim)
+        gga_encoder = S_encoder(repr_dim=args.repr_dim)
         s_encoder = S_encoder(repr_dim=args.repr_dim)
         g_encoder = S_encoder(repr_dim=args.repr_dim)
 
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    s_encoder_params = s_encoder.init(s_key, np.ones([1, args.obs_dim]))
+    gga_encoder_params = gga_encoder.init(gga_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
+    s_encoder_params = s_encoder.init(s_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
     # c = jnp.asarray(0.0, dtype=jnp.float32)
     critic_state = TrainState.create(
         apply_fn=None,
         params={"sa_encoder": sa_encoder_params,
+                "gga_encoder": gga_encoder_params,
                 "s_encoder": s_encoder_params,
                 "g_encoder": g_encoder_params},
         tx=optax.adam(learning_rate=args.critic_lr),
@@ -519,8 +525,6 @@ def main(args):
 
     def search_waypoint(training_state, env_state, planning_state):
         state, goal = env_state.obs[:, :args.obs_dim], env_state.obs[:, args.obs_dim:]
-        # s_repr = sa_encoder.apply(training_state.historical_critic_params["s_encoder"],state)
-        # g_repr = sa_encoder.apply(training_state.historical_critic_params["g_encoder"],goal)
         #
         # sw_dists = -energy_fn(s_repr[:, None], planning_state.projected_w_repr[None])  # (B, N)
         # wg_dists = -energy_fn(planning_state.w_repr[None], g_repr[:, None])  # (B, N)
@@ -534,9 +538,25 @@ def main(args):
         waypoint_xy = planning_state.waypoint_obs[:, args.goal_start_idx:args.goal_end_idx]
         goal_xy = goal
 
-        sw_dists = jnp.linalg.norm(state_xy[:, None] - waypoint_xy[None, :], axis=-1)  # (B, N)
-        wg_dists = jnp.linalg.norm(goal_xy[:, None] - waypoint_xy[None, :], axis=-1)  # (B, N)
-        sg_dist = jnp.linalg.norm(state_xy - goal_xy, axis=-1)  # (B, )
+        s_repr = s_encoder.apply(
+            training_state.historical_critic_params["s_encoder"],
+            state_xy
+        )
+        g_repr = g_encoder.apply(
+            training_state.historical_critic_params["g_encoder"],
+            goal_xy
+        )
+        w_s_repr = planning_state.w_s_repr
+        w_g_repr = planning_state.w_g_repr
+
+        if args.planner_use_repr:
+            sw_dists = -energy_fn(s_repr[:, None], w_g_repr[None, :])  # (B, N)
+            wg_dists = -energy_fn(w_s_repr[None, :], g_repr[:, None])  # (B, N)
+            sg_dist = -energy_fn(s_repr, g_repr)  # (B, )
+        else:
+            sw_dists = jnp.linalg.norm(state_xy[:, None] - waypoint_xy[None, :], axis=-1)  # (B, N)
+            wg_dists = jnp.linalg.norm(goal_xy[:, None] - waypoint_xy[None, :], axis=-1)  # (B, N)
+            sg_dist = jnp.linalg.norm(state_xy - goal_xy, axis=-1)  # (B, )
 
         sw_dists = jnp.where(sw_dists <= args.max_edge_dist, sw_dists, jnp.inf)
         wg_dists = jnp.where(wg_dists <= args.max_edge_dist, wg_dists, jnp.inf)
@@ -647,10 +667,9 @@ def main(args):
     @jax.jit
     def update_actor_and_alpha(transitions, training_state, key):
         def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
-            sa_encoder_params, s_encoder_params, g_encoder_params = (
+            sa_encoder_params, gga_encoder_params = (
                 critic_params["sa_encoder"],
-                critic_params["s_encoder"],
-                critic_params["g_encoder"]
+                critic_params["gga_encoder"]
             )
 
             obs = transitions.observation  # expected_shape = batch_size, obs_size + goal_size
@@ -672,9 +691,9 @@ def main(args):
             log_prob = log_prob.sum(-1)  # dimension = B
 
             sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
-            g_repr = g_encoder.apply(g_encoder_params, goal)
+            gga_repr = gga_encoder.apply(gga_encoder_params, goal)
 
-            qf_pi = energy_fn(sa_repr, g_repr)
+            qf_pi = energy_fn(sa_repr, gga_repr)
 
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
 
@@ -708,25 +727,27 @@ def main(args):
     @jax.jit
     def update_critic(transitions, training_state, key):
         def critic_loss(critic_params, transitions, key):
-            sa_encoder_params, s_encoder_params, g_encoder_params = (
+            sa_encoder_params, gga_encoder_params, s_encoder_params, g_encoder_params = (
                 critic_params["sa_encoder"],
+                critic_params["gga_encoder"],
                 critic_params["s_encoder"],
                 critic_params["g_encoder"]
             )
 
             obs = transitions.observation[:, :args.obs_dim]
             future_goal = transitions.extras["future_goal"]
-            future_state = transitions.extras["future_state"]
+            # future_state = transitions.extras["future_state"]
             action = transitions.action
 
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
+            gga_repr = gga_encoder.apply(gga_encoder_params, future_goal)
+            s_repr = s_encoder.apply(s_encoder_params, obs[:, args.goal_start_idx:args.goal_end_idx])
             g_repr = g_encoder.apply(g_encoder_params, future_goal)
-            s_repr = s_encoder.apply(s_encoder_params, obs)
             # sf_repr = s_encoder.apply(s_encoder_params, future_state)
 
             # InfoNCE
             # I = jnp.eye(obs.shape[0])
-            sag_logits = energy_fn(sa_repr[:, None, :], g_repr[None, :, :])
+            sag_logits = energy_fn(sa_repr[:, None, :], gga_repr[None, :, :])
             ssf_logits = energy_fn(s_repr[:, None, :], g_repr[None, :, :])
             # ssf_logits = energy_fn(s_repr[:, None, :], sf_repr[None, :, :])
             # sag_critic_loss = jnp.mean(optax.softmax_cross_entropy(sag_logits, I))
@@ -796,14 +817,20 @@ def main(args):
             transitions.observation[:, :args.obs_dim],
             transitions.observation[:, args.goal_start_idx:args.goal_end_idx]
         )
-        w_s_repr = s_encoder.apply(training_state.historical_critic_params["s_encoder"],waypoint_obs)
-        w_g_repr = g_encoder.apply(training_state.historical_critic_params["g_encoder"],waypoint_goal)
+        w_s_repr = s_encoder.apply(
+            training_state.historical_critic_params["s_encoder"],
+            waypoint_obs[:, args.goal_start_idx:args.goal_end_idx]
+        )
+        w_g_repr = g_encoder.apply(
+            training_state.historical_critic_params["g_encoder"],
+            waypoint_goal
+        )
 
-        # w_pdists = -energy_fn(w_s_repr[:, None], w_g_repr[None, :])
-        # w_pdists = jnp.where((w_pdists <= args.max_edge_dist), w_pdists, jnp.inf)
-
-        waypoint_xy = waypoint_goal
-        w_pdists = jnp.linalg.norm(waypoint_xy[None] - waypoint_xy[:, None], axis=-1)
+        if args.planner_use_repr:
+            w_pdists = -energy_fn(w_s_repr[:, None], w_g_repr[None, :])
+        else:
+            waypoint_xy = waypoint_goal
+            w_pdists = jnp.linalg.norm(waypoint_xy[None] - waypoint_xy[:, None], axis=-1)
         w_pdists = jnp.where((w_pdists <= args.max_edge_dist), w_pdists, jnp.inf)
         # w_pdists = jnp.where((w_pdists >= args.min_edge_dist), w_pdists, jnp.inf)
 

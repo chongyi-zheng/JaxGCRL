@@ -480,14 +480,14 @@ def main(args):
     # Critic
     if args.quasimetric_energy_type == 'mrn':
         sa_encoder = SA_encoder(repr_dim=2 * args.repr_dim)
-        g_encoder = G_encoder(repr_dim=2 * args.repr_dim)
+        gga_encoder = SA_encoder(repr_dim=2 * args.repr_dim)
         projection = Projection(repr_dim=2 * args.repr_dim)
     else:
         sa_encoder = SA_encoder(repr_dim=args.repr_dim)
-        g_encoder = G_encoder(repr_dim=args.repr_dim)
+        gga_encoder = SA_encoder(repr_dim=args.repr_dim)
         projection = Projection(repr_dim=args.repr_dim)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    g_encoder_params = g_encoder.init(g_key, np.ones([1, args.obs_dim]))
+    gga_encoder_params = gga_encoder.init(g_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
     if args.quasimetric_energy_type == 'mrn':
         proj_params = projection.init(rot_key, np.ones([1, 2 * args.repr_dim]))
     else:
@@ -497,7 +497,7 @@ def main(args):
     critic_state = TrainState.create(
         apply_fn=None,
         params={"sa_encoder": sa_encoder_params,
-                "g_encoder": g_encoder_params,
+                "gga_encoder": gga_encoder_params,
                 "projection": proj_params},
         tx=optax.adam(learning_rate=args.critic_lr),
     )
@@ -513,7 +513,7 @@ def main(args):
 
     actor.apply = jax.jit(actor.apply)
     sa_encoder.apply = jax.jit(sa_encoder.apply)
-    g_encoder.apply = jax.jit(g_encoder.apply)
+    gga_encoder.apply = jax.jit(gga_encoder.apply)
 
     # Trainstate
     training_state = TrainingState(
@@ -990,18 +990,19 @@ def main(args):
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            sa_encoder_params, g_encoder_params, proj_params = (
-                critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
+            sa_encoder_params, gga_encoder_params, proj_params = (
+                critic_params["sa_encoder"], critic_params["gga_encoder"], critic_params["projection"])
             # s_repr = g_encoder.apply(g_encoder_params, state)
             # sa_repr = projection.apply(proj_params, s_repr, action)
             # g_repr = g_encoder.apply(g_encoder_params, goal)
             sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
             # sa_repr = projection.apply(proj_params, sa_repr)
-            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
-            g_repr = projection.apply(proj_params, g_repr)
+            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            # g_repr = projection.apply(proj_params, g_repr)
+            gga_repr = gga_encoder.apply(gga_encoder_params, goal, goal_action)
 
             # qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
-            qf_pi = energy_fn(sa_repr, g_repr)
+            qf_pi = energy_fn(sa_repr, gga_repr)
             # qf_pi = -jnp.mean((sa_repr - g_repr) ** 2, axis=-1)
 
             actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - (qf_pi))
@@ -1035,8 +1036,8 @@ def main(args):
     @jax.jit
     def update_critic(transitions, training_state, key):
         def critic_loss(critic_params, transitions, key):
-            sa_encoder_params, g_encoder_params, proj_params = (
-                critic_params["sa_encoder"], critic_params["g_encoder"], critic_params["projection"])
+            sa_encoder_params, gga_encoder_params, proj_params = (
+                critic_params["sa_encoder"], critic_params["gga_encoder"], critic_params["projection"])
 
             obs = transitions.observation[:, :args.obs_dim]
             action = transitions.action
@@ -1051,16 +1052,17 @@ def main(args):
             # g_repr = jax.lax.stop_gradient(g_repr)
             sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
             # sa_repr = projection.apply(proj_params, jax.lax.stop_gradient(sa_repr))
-            g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
+            # g_repr = sa_encoder.apply(sa_encoder_params, goal, goal_action)
             # g_repr = jax.lax.stop_gradient(g_repr)
             # g_repr = projection.apply(proj_params, g_repr)
-            g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
+            # g_repr = projection.apply(proj_params, jax.lax.stop_gradient(g_repr))
             # rand_g_repr = sa_encoder.apply(sa_encoder_params, rand_goal, rand_goal_action)
             # rand_g_repr = projection.apply(proj_params, jax.lax.stop_gradient(rand_g_repr))
+            gga_repr = gga_encoder.apply(gga_encoder_params, goal, goal_action)
 
             # InfoNCE
             # logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))  # shape = B x B
-            logits = energy_fn(sa_repr[:, None, :], g_repr[None, :, :])
+            logits = energy_fn(sa_repr[:, None, :], gga_repr[None, :, :])
             # logits = -jnp.mean((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1)  # shape = B x B
             # logits_no_resubs = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - rand_g_repr[None, :, :]) ** 2, axis=-1))
             # logits_no_resubs = jnp.fill_diagonal(logits, -jnp.inf, inplace=False)

@@ -176,7 +176,8 @@ def bellman_ford_with_midwaypoints(adj_matrix, src):
     path, _, start_index = jax.vmap(get_shortest_path, in_axes=(None, None, None, 0))(
       distances, predecessors, src, jnp.arange(n))
 
-    mid_index = (start_index + n) // 2
+    # mid_index = (start_index + n) // 2
+    mid_index = jnp.ceil(start_index + (n - start_index) / 4).astype(dtype=jnp.int32)
     mid_waypoints = path[jnp.arange(n), mid_index]
 
     return distances, predecessors, mid_waypoints, has_negative_cycle
